@@ -41,10 +41,18 @@ func TestConfigAnomalyRuleCountIndex(t *testing.T) {
 		t.Errorf("ConfigAnomalyRuleCount = %d, want 10 (must match xdrop.h CONFIG_ANOMALY_RULE_COUNT)",
 			ConfigAnomalyRuleCount)
 	}
+	if ConfigRLCPUDivisor != 11 {
+		t.Errorf("ConfigRLCPUDivisor = %d, want 11 (must match xdrop.h CONFIG_RL_CPU_DIVISOR)",
+			ConfigRLCPUDivisor)
+	}
+	if ConfigMapEntries != 12 {
+		t.Errorf("ConfigMapEntries = %d, want 12 (must match xdrop.h CONFIG_MAP_ENTRIES)",
+			ConfigMapEntries)
+	}
 	// Map capacity must be at least enough to hold the last slot index.
-	if ConfigMapEntries < ConfigAnomalyRuleCount+1 {
-		t.Errorf("ConfigMapEntries = %d, must be >= %d to hold anomaly count slot",
-			ConfigMapEntries, ConfigAnomalyRuleCount+1)
+	if ConfigMapEntries < ConfigRLCPUDivisor+1 {
+		t.Errorf("ConfigMapEntries = %d, must be >= %d to hold rate-limit divisor slot",
+			ConfigMapEntries, ConfigRLCPUDivisor+1)
 	}
 }
 

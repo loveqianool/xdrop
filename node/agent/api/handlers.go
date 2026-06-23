@@ -45,8 +45,7 @@ func NewHandlers(blacklist, whitelist, whitelistB, stats, configA, configB, acti
 		tailcallFailStats: tailcallFailStats, // Phase 8
 	}
 
-	// Initialize dynamic config items (bitmap=0, count=0, wl_count=0)
-	// Only writes index 0/1/2, does not touch 3(reserved)/4(FF)/5(ifindex)
+	// Initialize dynamic config items before startup-specific config writes.
 	if err := h.initDynamicConfig(configA); err != nil {
 		log.Fatalf("[NewHandlers] Failed to init config_a: %v", err)
 	}
@@ -103,11 +102,12 @@ func (h *Handlers) Shutdown() {
 func (h *Handlers) initDynamicConfig(m *ebpf.Map) error {
 	for _, idx := range []uint32{
 		ConfigBlacklistCount, ConfigWhitelistCount, ConfigRuleBitmap,
-		ConfigWLBitmap,           // Phase 8: slot 3
+		ConfigWLBitmap, // Phase 8: slot 3
 		ConfigFastForwardEnabled, ConfigFilterIfindex,
 		ConfigCIDRRuleCount, ConfigCIDRBitmap,
-		ConfigWLMapSelector,      // Phase 8: slot 8
+		ConfigWLMapSelector, // Phase 8: slot 8
 		ConfigRuleMapSelector,
+		ConfigAnomalyRuleCount, ConfigRLCPUDivisor,
 	} {
 		key := make([]byte, 4)
 		binary.LittleEndian.PutUint32(key, idx)

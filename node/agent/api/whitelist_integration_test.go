@@ -3,29 +3,31 @@
 // whitelist_integration_test.go — Phase 8 whitelist double-buffer integration tests.
 //
 // Requires CAP_BPF + /sys/fs/bpf mount. Run via:
-//   go test -tags=integration -race ./node/agent/api/... -run TestWL -v
+//
+//	go test -tags=integration -race ./node/agent/api/... -run TestWL -v
 //
 // Coverage:
-//   T14c — exhaustive bitmap bit set/clear via refcount loop
-//   T15  — DoWhitelistAtomicSync normal path: shadow→flip→commit
-//   T16  — DoWhitelistAtomicSync consecutive two syncs (double-flip)
-//   T17  — DoWhitelistAtomicSync empty entries (clear all)
-//   T19  — DoWhitelistAtomicSync shadow insert failure leaves active unchanged
-//   T20  — DoWhitelistAtomicSync publish failure rolls back slot+refcount
-//   T21  — single AddWhitelistFromSync/delete writes to active map
-//   T23  — CONFIG_WL_MAP_SELECTOR independent from CONFIG_RULE_MAP_SELECTOR
-//   T24b — publishConfigUpdateForWLSync preserves BL/CIDR/anomaly/FF slots
-//   T25  — AddWhitelistFromSync: publish succeeds, BPF insert fails → rollback
-//   T26  — AddWhitelistBatch: partial BPF insert failure rolls back entire batch
-//   T27  — DeleteWhitelist: publish fails → full rollback (BPF re-insert + refcount)
-//   T27b — AddWhitelistFromSync same-ID replacement (same combo)
-//   T27c — AddWhitelistFromSync same-ID replacement (different combo)
-//   T27d — AddWhitelistFromSync same-ID replacement, new BPF insert fails
-//   T27e — AddWhitelistBatch containing same-ID replacement
-//   T27f — AddWhitelistFromSync same-ID key already owned by other ID → conflict
-//   T28  — DoWhitelistAtomicSync blocks concurrent AddWhitelistFromSync (syncMu)
-//   T29  — DoWhitelistAtomicSync blocks concurrent DeleteWhitelistBatch (syncMu)
-//   T30  — two DoWhitelistAtomicSync calls serialize (no concurrent execution)
+//
+//	T14c — exhaustive bitmap bit set/clear via refcount loop
+//	T15  — DoWhitelistAtomicSync normal path: shadow→flip→commit
+//	T16  — DoWhitelistAtomicSync consecutive two syncs (double-flip)
+//	T17  — DoWhitelistAtomicSync empty entries (clear all)
+//	T19  — DoWhitelistAtomicSync shadow insert failure leaves active unchanged
+//	T20  — DoWhitelistAtomicSync publish failure rolls back slot+refcount
+//	T21  — single AddWhitelistFromSync/delete writes to active map
+//	T23  — CONFIG_WL_MAP_SELECTOR independent from CONFIG_RULE_MAP_SELECTOR
+//	T24b — publishConfigUpdateForWLSync preserves BL/CIDR/anomaly/FF slots
+//	T25  — AddWhitelistFromSync: publish succeeds, BPF insert fails → rollback
+//	T26  — AddWhitelistBatch: partial BPF insert failure rolls back entire batch
+//	T27  — DeleteWhitelist: publish fails → full rollback (BPF re-insert + refcount)
+//	T27b — AddWhitelistFromSync same-ID replacement (same combo)
+//	T27c — AddWhitelistFromSync same-ID replacement (different combo)
+//	T27d — AddWhitelistFromSync same-ID replacement, new BPF insert fails
+//	T27e — AddWhitelistBatch containing same-ID replacement
+//	T27f — AddWhitelistFromSync same-ID key already owned by other ID → conflict
+//	T28  — DoWhitelistAtomicSync blocks concurrent AddWhitelistFromSync (syncMu)
+//	T29  — DoWhitelistAtomicSync blocks concurrent DeleteWhitelistBatch (syncMu)
+//	T30  — two DoWhitelistAtomicSync calls serialize (no concurrent execution)
 package api
 
 import (
@@ -56,7 +58,7 @@ func newWLHashMap(t *testing.T, name string) *ebpf.Map {
 	return m
 }
 
-// newCfgArray creates a config_a / config_b array map (11 uint64 slots).
+// newCfgArray creates a config_a / config_b array map (12 uint64 slots).
 func newCfgArray(t *testing.T, name string) *ebpf.Map {
 	t.Helper()
 	m, err := ebpf.NewMap(&ebpf.MapSpec{
@@ -501,7 +503,7 @@ func TestWL_T23_WLSelectorIndependentFromBLSelector(t *testing.T) {
 
 // T24b: when DoWhitelistAtomicSync publishes, it must preserve all non-WL config
 // slots: BL count, BL bitmap, CIDR count, CIDR bitmap, anomaly count, FF enabled,
-// filter ifindex, BL rule map selector.
+// filter ifindex, BL rule map selector, rate-limit CPU divisor.
 func TestWL_T24b_AtomicSyncPreservesBLState(t *testing.T) {
 	h := newWLTestHandlers(t)
 
@@ -517,6 +519,7 @@ func TestWL_T24b_AtomicSyncPreservesBLState(t *testing.T) {
 		writeSlot(t, m, ConfigFastForwardEnabled, 1)
 		writeSlot(t, m, ConfigFilterIfindex, 7)
 		writeSlot(t, m, ConfigRuleMapSelector, 1)
+		writeSlot(t, m, ConfigRLCPUDivisor, 32)
 	}
 	// Also set in-memory BL state so publishConfigUpdate doesn't recompute
 	// these to 0 (bitmap is rebuilt from comboRefCount).
@@ -548,6 +551,7 @@ func TestWL_T24b_AtomicSyncPreservesBLState(t *testing.T) {
 		{"ConfigFastForwardEnabled", ConfigFastForwardEnabled, 1},
 		{"ConfigFilterIfindex", ConfigFilterIfindex, 7},
 		{"ConfigRuleMapSelector", ConfigRuleMapSelector, 1},
+		{"ConfigRLCPUDivisor", ConfigRLCPUDivisor, 32},
 	}
 	for _, c := range checks {
 		got := readSlot(t, active, c.slot)

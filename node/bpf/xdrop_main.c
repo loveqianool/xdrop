@@ -84,7 +84,7 @@ BPF_MAP_ADD(active_config);
 
 // Rate limit state map (per-rule token bucket)
 BPF_MAP_DEF(rl_states) = {
-    .map_type = BPF_MAP_TYPE_HASH,
+    .map_type = BPF_MAP_TYPE_PERCPU_HASH,
     .key_size = sizeof(struct rule_key),
     .value_size = sizeof(struct rate_limit_state),
     .max_entries = MAX_RULES,
@@ -144,7 +144,7 @@ BPF_MAP_ADD(cidr_blacklist);
 
 // CIDR rate limit state map
 BPF_MAP_DEF(cidr_rl_states) = {
-    .map_type = BPF_MAP_TYPE_HASH,
+    .map_type = BPF_MAP_TYPE_PERCPU_HASH,
     .key_size = sizeof(struct cidr_rule_key),
     .value_size = sizeof(struct rate_limit_state),
     .max_entries = MAX_RULES,
@@ -243,6 +243,22 @@ static INLINE __u64 *config_lookup(__u64 slot, __u32 key_idx) {
   } else {
     return bpf_map_lookup_elem(&config_b, &key_idx);
   }
+}
+
+static INLINE __u64 rate_limit_percpu_rate(__u64 total_rate, __u64 slot) {
+  __u32 idx = CONFIG_RL_CPU_DIVISOR;
+  __u64 divisor = RL_DIVISOR_FALLBACK;
+  __u64 *configured = config_lookup(slot, idx);
+  if (configured && *configured > 0) {
+    divisor = *configured;
+  }
+
+  __u64 rate = (total_rate + divisor - 1) / divisor;
+  return rate > 0 ? rate : 1;
+}
+
+static INLINE __u64 rate_limit_elapsed_cap(void) {
+  return RATE_LIMIT_BURST_MULTIPLIER * 1000000000ULL;
 }
 
 // Helper: read rule map selector from the given config slot
@@ -2826,7 +2842,7 @@ int xdp_firewall_main(struct xdp_md *ctx) {
     if (rule->action == ACTION_RATE_LIMIT && rule->rate_limit > 0) {
       // Token bucket rate limiting
       __u64 now = bpf_ktime_get_ns();
-      __u64 rate_pps = rule->rate_limit;
+      __u64 rate_pps = rate_limit_percpu_rate(rule->rate_limit, config_slot);
       __u64 max_tokens = rate_pps * RATE_LIMIT_BURST_MULTIPLIER;
 
       struct rate_limit_state *state =
@@ -2836,7 +2852,23 @@ int xdp_firewall_main(struct xdp_md *ctx) {
             .tokens = max_tokens - 1,
             .last_update = now,
         };
-        bpf_map_update_elem(&rl_states, &matched_key, &new_state, BPF_ANY);
+        if (bpf_map_update_elem(&rl_states, &matched_key, &new_state,
+                                BPF_ANY) != 0) {
+          rule->drop_count++;
+          stats_inc(STATS_RATE_LIMITED);
+          stats_inc(STATS_DROPPED_PACKETS);
+          return XDP_DROP;
+        }
+        stats_inc(STATS_PASSED_PACKETS);
+        if (fast_forward) {
+          return bpf_redirect_map(&devmap, ingress_ifindex, 0);
+        }
+        return XDP_PASS;
+      }
+
+      if (state->last_update == 0) {
+        state->tokens = max_tokens - 1;
+        state->last_update = now;
         stats_inc(STATS_PASSED_PACKETS);
         if (fast_forward) {
           return bpf_redirect_map(&devmap, ingress_ifindex, 0);
@@ -2845,6 +2877,10 @@ int xdp_firewall_main(struct xdp_md *ctx) {
       }
 
       __u64 elapsed_ns = now - state->last_update;
+      __u64 max_elapsed_ns = rate_limit_elapsed_cap();
+      if (elapsed_ns > max_elapsed_ns) {
+        elapsed_ns = max_elapsed_ns;
+      }
       __u64 tokens_to_add = (elapsed_ns * rate_pps) / 1000000000ULL;
 
       __u64 new_tokens = state->tokens + tokens_to_add;
@@ -2945,7 +2981,8 @@ int xdp_firewall_main(struct xdp_md *ctx) {
       if (cidr_rule->action == ACTION_RATE_LIMIT &&
           cidr_rule->rate_limit > 0) {
         __u64 now = bpf_ktime_get_ns();
-        __u64 rate_pps = cidr_rule->rate_limit;
+        __u64 rate_pps = rate_limit_percpu_rate(cidr_rule->rate_limit,
+                                                config_slot);
         __u64 max_tokens = rate_pps * RATE_LIMIT_BURST_MULTIPLIER;
 
         struct rate_limit_state *state =
@@ -2955,8 +2992,23 @@ int xdp_firewall_main(struct xdp_md *ctx) {
               .tokens = max_tokens - 1,
               .last_update = now,
           };
-          bpf_map_update_elem(&cidr_rl_states, &cidr_matched_key, &new_state,
-                              BPF_ANY);
+          if (bpf_map_update_elem(&cidr_rl_states, &cidr_matched_key,
+                                  &new_state, BPF_ANY) != 0) {
+            cidr_rule->drop_count++;
+            stats_inc(STATS_RATE_LIMITED);
+            stats_inc(STATS_DROPPED_PACKETS);
+            return XDP_DROP;
+          }
+          stats_inc(STATS_PASSED_PACKETS);
+          if (fast_forward) {
+            return bpf_redirect_map(&devmap, ingress_ifindex, 0);
+          }
+          return XDP_PASS;
+        }
+
+        if (state->last_update == 0) {
+          state->tokens = max_tokens - 1;
+          state->last_update = now;
           stats_inc(STATS_PASSED_PACKETS);
           if (fast_forward) {
             return bpf_redirect_map(&devmap, ingress_ifindex, 0);
@@ -2965,6 +3017,10 @@ int xdp_firewall_main(struct xdp_md *ctx) {
         }
 
         __u64 elapsed_ns = now - state->last_update;
+        __u64 max_elapsed_ns = rate_limit_elapsed_cap();
+        if (elapsed_ns > max_elapsed_ns) {
+          elapsed_ns = max_elapsed_ns;
+        }
         __u64 tokens_to_add = (elapsed_ns * rate_pps) / 1000000000ULL;
 
         __u64 new_tokens = state->tokens + tokens_to_add;

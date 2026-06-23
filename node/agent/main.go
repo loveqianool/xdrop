@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -25,7 +26,7 @@ import (
 // Config map indices now live in the api package alongside the other
 // dynamic config slots so initDynamicConfig can zero them on every
 // startup (AUD-PH3-001). main.go uses api.ConfigFastForwardEnabled /
-// api.ConfigFilterIfindex at its own write sites in configureFastForward.
+// api.ConfigFilterIfindex / api.ConfigRLCPUDivisor at its own write sites.
 
 func main() {
 	// Command-line flags (optionally override config file values)
@@ -279,6 +280,9 @@ func main() {
 		cidrBlacklist, cidrRlStates, cidrMgr,
 		blacklistB, cidrBlacklistB,
 		tailcallFailStats)
+	if err := configureRateLimitDivisor(configA, configB); err != nil {
+		log.Fatalf("Failed to configure rate-limit divisor: %v", err)
+	}
 
 	// Setup graceful shutdown BEFORE XDP attach and ifmgr config, so Ctrl-C
 	// during startup still runs cleanup. The goroutine captures ifMgr,
@@ -632,6 +636,27 @@ func setupDevmap(devmap *ebpf.Map, inboundIdx, outboundIdx int) error {
 		return fmt.Errorf("failed to set devmap[%d]=%d: %w", outboundIdx, inboundIdx, err)
 	}
 
+	return nil
+}
+
+func configureRateLimitDivisor(configA, configB *ebpf.Map) error {
+	divisor := runtime.NumCPU()
+	if divisor < 1 {
+		divisor = 1
+	}
+
+	key := make([]byte, 4)
+	binary.LittleEndian.PutUint32(key, api.ConfigRLCPUDivisor)
+	value := make([]byte, 8)
+	binary.LittleEndian.PutUint64(value, uint64(divisor))
+
+	for _, m := range []*ebpf.Map{configA, configB} {
+		if err := m.Update(key, value, ebpf.UpdateExist); err != nil {
+			return fmt.Errorf("failed to set rate-limit CPU divisor: %w", err)
+		}
+	}
+
+	log.Printf("[rate_limit] divisor auto-selected: divisor=%d source=online_cpu", divisor)
 	return nil
 }
 

@@ -254,6 +254,10 @@ struct rate_limit_state {
 
 // Rate limit configuration
 #define RATE_LIMIT_BURST_MULTIPLIER 2 // Allow burst = rate * 2
+// Conservative fallback used before userspace writes CONFIG_RL_CPU_DIVISOR.
+// Keep this >= expected production CPU count so a missing divisor fails tight
+// instead of turning the aggregate limit into rate * ncpu.
+#define RL_DIVISOR_FALLBACK 256
 
 // CIDR config map indices (continuing from existing 0-5)
 #define CONFIG_CIDR_RULE_COUNT   6   // total CIDR rule count
@@ -269,8 +273,11 @@ struct rate_limit_state {
 // on every rule add / delete / update / sync that changes anomaly rule count.
 #define CONFIG_ANOMALY_RULE_COUNT 10
 
+// Auto-selected divisor for PERCPU_HASH rate-limit buckets.
+#define CONFIG_RL_CPU_DIVISOR 11
+
 // Double-buffer config map entries
-#define CONFIG_MAP_ENTRIES 11
+#define CONFIG_MAP_ENTRIES 12
 
 // tail_call prog_array slot assignments.
 // max_entries=16, reserved slot layout:

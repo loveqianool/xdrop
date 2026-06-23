@@ -63,7 +63,7 @@ func writeSlot(t *testing.T, m *ebpf.Map, idx uint32, v uint64) {
 
 // TestInitDynamicConfig_ZerosFFSlots is the AUD-PH3-001 regression
 // anchor. Pre-populate a config_a-like array with FF_ENABLED=1 and
-// FILTER_IFINDEX=5 (simulating the residue of a previous FF-mode
+// FILTER_IFINDEX=5 and RL_CPU_DIVISOR=99 (simulating the residue of a previous
 // agent life on a pinned config map), then run initDynamicConfig,
 // and assert those slots come out zero.
 func TestInitDynamicConfig_ZerosFFSlots(t *testing.T) {
@@ -71,6 +71,7 @@ func TestInitDynamicConfig_ZerosFFSlots(t *testing.T) {
 
 	writeSlot(t, m, ConfigFastForwardEnabled, 1)
 	writeSlot(t, m, ConfigFilterIfindex, 5)
+	writeSlot(t, m, ConfigRLCPUDivisor, 99)
 	// Also plant non-zero values in the slots that were already being
 	// zeroed pre-fix; they should remain zeroed post-fix (no regression).
 	writeSlot(t, m, ConfigBlacklistCount, 42)
@@ -90,11 +91,12 @@ func TestInitDynamicConfig_ZerosFFSlots(t *testing.T) {
 		{"ConfigBlacklistCount", ConfigBlacklistCount},
 		{"ConfigWhitelistCount", ConfigWhitelistCount},
 		{"ConfigRuleBitmap", ConfigRuleBitmap},
-		{"ConfigWLBitmap", ConfigWLBitmap},           // Phase 8: slot 3
+		{"ConfigWLBitmap", ConfigWLBitmap}, // Phase 8: slot 3
 		{"ConfigCIDRRuleCount", ConfigCIDRRuleCount},
 		{"ConfigCIDRBitmap", ConfigCIDRBitmap},
 		{"ConfigWLMapSelector", ConfigWLMapSelector}, // Phase 8: slot 8
 		{"ConfigRuleMapSelector", ConfigRuleMapSelector},
+		{"ConfigRLCPUDivisor", ConfigRLCPUDivisor},
 	} {
 		if got := readSlot(t, m, slot.idx); got != 0 {
 			t.Errorf("slot %s (idx=%d) = %d after init, want 0", slot.name, slot.idx, got)

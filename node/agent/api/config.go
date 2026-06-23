@@ -275,7 +275,7 @@ func (h *Handlers) shadowWhitelist() *ebpf.Map {
 // Unlike the general publishConfigUpdate, this function:
 //   - Writes absolute whitelist count (not a delta)
 //   - Rebuilds WL bitmap from the provided newWLComboRefCount (not h.wlComboRefCount)
-//   - Preserves all other config slots byte-for-byte (BL, CIDR, anomaly, FF, etc.)
+//   - Preserves all other config slots byte-for-byte (BL, CIDR, anomaly, FF, rate-limit divisor, etc.)
 //   - Flips the active_config selector
 //
 // Caller must hold publishMu and have already set h.activeWLSlot to the new value.

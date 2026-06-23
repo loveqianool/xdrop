@@ -12,7 +12,7 @@ import (
 const (
 	ProtoAll    = 0
 	ProtoICMP   = 1
-	ProtoIGMP   = 2  // v2.6 Phase 1: IGMP (IANA)
+	ProtoIGMP   = 2 // v2.6 Phase 1: IGMP (IANA)
 	ProtoTCP    = 6
 	ProtoUDP    = 17
 	ProtoGRE    = 47 // v2.6 Phase 1: GRE (IANA)
@@ -39,13 +39,14 @@ const (
 	ConfigCIDRRuleCount      = 6
 	ConfigCIDRBitmap         = 7
 	// Phase 8: whitelist dual-buffer selector (was reserved ConfigCIDRBitmapValid)
-	ConfigWLMapSelector = 8
+	ConfigWLMapSelector   = 8
 	ConfigRuleMapSelector = 9 // 0=A, 1=B (dual rule map Phase 4.2)
 	// v2.6.1 Phase 4 B5: counts rules with MatchAnomaly != 0 across
 	// exact + CIDR blacklist. Non-zero gates main program's tail_call
 	// dispatch into xdp_anomaly_verify. MUST match xdrop.h CONFIG_ANOMALY_RULE_COUNT.
 	ConfigAnomalyRuleCount = 10
-	ConfigMapEntries       = 11
+	ConfigRLCPUDivisor     = 11
+	ConfigMapEntries       = 12
 )
 
 // IPAddr represents a 128-bit IP address (IPv4-mapped or native IPv6)
@@ -138,7 +139,7 @@ type Handlers struct {
 	activeRuleSlot int // 0 = blacklist/cidrBlacklist active, 1 = blacklistB/cidrBlacklistB active
 
 	// Phase 8: whitelist dual-buffer selector (independent from blacklist)
-	activeWLSlot    int    // 0 = whitelist active, 1 = whitelistB active
+	activeWLSlot    int     // 0 = whitelist active, 1 = whitelistB active
 	wlComboRefCount [64]int // per-combo ref count for whitelist bitmap (protected by publishMu+wlMu)
 
 	// Global publish lock: all publishConfigUpdate() calls must hold this lock.
