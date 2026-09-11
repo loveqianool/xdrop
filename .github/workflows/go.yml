@@ -1,4 +1,4 @@
-name: XDrop Multi-Arch Multi-Libc Build
+name: XDrop Multi-Arch Build
 
 on:
   push:
@@ -12,11 +12,11 @@ env:
 
 jobs:
   # ============================================================
-  # 1. Go Controller —— x86_64 / aarch64, glibc / musl
-  #    XDrop Controller 通常不需要 CGO,可静态编译
+  # 1. Go Controller —— x86_64 / aarch64
+  #    纯 Go,CGO_ENABLED=0,静态二进制
   # ============================================================
   build-controller:
-    name: Build Go Controller (${{ matrix.arch }}-${{ matrix.libc }})
+    name: Build Controller (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -24,32 +24,10 @@ jobs:
         include:
           - arch: amd64
             goarch: amd64
-            libc: glibc
-            cgo: "0"
-            cc: gcc
-            runner: ubuntu-latest
-          - arch: amd64
-            goarch: amd64
-            libc: musl
-            cgo: "0"
-            cc: musl-gcc
             runner: ubuntu-latest
           - arch: arm64
             goarch: arm64
-            libc: glibc
-            cgo: "0"
-            cc: gcc
             runner: ubuntu-24.04-arm
-          - arch: arm64
-            goarch: arm64
-            libc: musl
-            cgo: "0"
-            cc: musl-gcc
-            runner: ubuntu-24.04-arm
-
-    defaults:
-      run:
-        working-directory: ./controller
 
     steps:
       - uses: actions/checkout@v4
@@ -69,41 +47,43 @@ jobs:
           cache: 'npm'
           cache-dependency-path: controller/web/package-lock.json
 
-      - name: Build frontend
-        working-directory: ./controller/web
-        run: |
-          npm ci
-          npm run build
-
-      - name: Build Controller
+      - name: Build Controller (via project script)
         env:
-          CGO_ENABLED: ${{ matrix.cgo }}
           GOOS: linux
           GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
         run: |
-          go build -trimpath -ldflags "-s -w" -o bin/xdrop-controller ./cmd
+          chmod +x scripts/build-controller.sh
+          ./scripts/build-controller.sh
+
+      - name: Verify architecture
+        run: |
+          BIN="controller/xdrop-controller"
+          test -f "$BIN" || { echo "::error::$BIN not found"; ls -la controller/; exit 1; }
+          file "$BIN"
+          case "${{ matrix.goarch }}" in
+            amd64) file "$BIN" | grep -q "x86-64"  || { echo "::error::expected x86-64";  exit 1; } ;;
+            arm64) file "$BIN" | grep -q "aarch64" || { echo "::error::expected aarch64"; exit 1; } ;;
+          esac
 
       - name: Rename output
         run: |
-          mv bin/xdrop-controller \
-             bin/xdrop-controller-linux-${{ matrix.arch }}-${{ matrix.libc }}
+          mkdir -p dist
+          cp controller/xdrop-controller dist/xdrop-controller-linux-${{ matrix.arch }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: xdrop-controller-linux-${{ matrix.arch }}-${{ matrix.libc }}
-          path: controller/bin/xdrop-controller-linux-${{ matrix.arch }}-${{ matrix.libc }}
+          name: xdrop-controller-linux-${{ matrix.arch }}
+          path: dist/xdrop-controller-linux-${{ matrix.arch }}
 
   # ============================================================
-  # 2. BPF 数据面 —— clang 编译为架构无关的 eBPF 对象
-  #    BPF 字节码不区分 arch/libc,仅编译一次
+  # 2. BPF 对象 —— 架构无关,只编译一次
+  #    产出 xdrop_main.elf + xdrop_gate.elf
   # ============================================================
   build-bpf:
-    name: Build BPF Object
+    name: Build BPF Objects
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: ./node/bpf
     steps:
       - uses: actions/checkout@v4
 
@@ -111,32 +91,50 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            clang llvm libbpf-dev libelf-dev \
-            linux-libc-dev linux-tools-common build-essential
+            clang llvm libbpf-dev libelf-dev pkg-config \
+            linux-libc-dev build-essential
+
+      - name: Install bpftool (static, kernel-independent)
+        run: |
+          BPFTOOL_VERSION=v7.5.0
+          curl -sL "https://github.com/libbpf/bpftool/releases/download/${BPFTOOL_VERSION}/bpftool-${BPFTOOL_VERSION}-amd64.tar.gz" \
+            | tar -xz
+          sudo mv bpftool /usr/local/bin/bpftool
+          sudo chmod +x /usr/local/bin/bpftool
+          bpftool version
 
       - name: Generate vmlinux.h
         run: |
-          sudo apt-get install -y bpftool || true
-          if [ ! -f /sys/kernel/btf/vmlinux ]; then
-            echo "::error::No BTF on runner kernel"; exit 1
-          fi
-          bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h
+          test -f /sys/kernel/btf/vmlinux || { echo "::error::no BTF on runner"; exit 1; }
+          bpftool btf dump file /sys/kernel/btf/vmlinux format c > node/bpf/vmlinux.h
 
-      - name: Build BPF
-        run: make
+      - name: Build BPF (via project script)
+        run: |
+          chmod +x scripts/build-node.sh
+          ./scripts/build-node.sh bpf
 
-      - name: Upload artifact
+      - name: Verify ELFs
+        run: |
+          for f in node/bpf/xdrop_main.elf node/bpf/xdrop_gate.elf; do
+            test -f "$f" || { echo "::error::$f missing"; exit 1; }
+            file "$f"
+          done
+
+      - name: Upload BPF artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: xdrop-bpf-object
-          path: node/bpf/*.o
+          name: xdrop-bpf-elf
+          path: |
+            node/bpf/xdrop_main.elf
+            node/bpf/xdrop_gate.elf
+          if-no-files-found: error
 
   # ============================================================
-  # 3. Go Node Agent —— x86_64 / aarch64, glibc / musl
-  #    Agent 需要 CGO(链接 libbpf),因此区分 libc
+  # 3. Go Agent —— x86_64 / aarch64,静态编译
+  #    依赖 BPF 作业的 ELF,与 ELF 一起打包
   # ============================================================
   build-agent:
-    name: Build Go Agent (${{ matrix.arch }}-${{ matrix.libc }})
+    name: Build Agent (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     needs: [build-bpf]
     strategy:
@@ -145,40 +143,18 @@ jobs:
         include:
           - arch: amd64
             goarch: amd64
-            libc: glibc
-            cgo: "1"
-            cc: gcc
-            runner: ubuntu-latest
-          - arch: amd64
-            goarch: amd64
-            libc: musl
-            cgo: "1"
-            cc: musl-gcc
             runner: ubuntu-latest
           - arch: arm64
             goarch: arm64
-            libc: glibc
-            cgo: "1"
-            cc: gcc
             runner: ubuntu-24.04-arm
-          - arch: arm64
-            goarch: arm64
-            libc: musl
-            cgo: "1"
-            cc: musl-gcc
-            runner: ubuntu-24.04-arm
-
-    defaults:
-      run:
-        working-directory: ./node/agent
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download BPF object
+      - name: Download BPF ELFs
         uses: actions/download-artifact@v4
         with:
-          name: xdrop-bpf-object
+          name: xdrop-bpf-elf
           path: node/bpf
 
       - name: Setup Go
@@ -189,37 +165,45 @@ jobs:
           cache: true
           cache-dependency-path: node/agent/go.sum
 
-      - name: Install system deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            clang llvm libbpf-dev libelf-dev pkg-config \
-            linux-libc-dev build-essential zlib1g-dev musl-tools
-
-      - name: Build Agent
+      - name: Build Agent (via project script)
         env:
-          CGO_ENABLED: ${{ matrix.cgo }}
           GOOS: linux
           GOARCH: ${{ matrix.goarch }}
-          CC: ${{ matrix.cc }}
-          CGO_CFLAGS: "-I/usr/include -I${{ matrix.arch == 'arm64' && '/usr/include/aarch64-linux-gnu' || '/usr/include/x86_64-linux-gnu' }}"
-          CGO_LDFLAGS: "-lelf -lz"
+          CGO_ENABLED: "0"          # cilium/ebpf —— 纯 Go,静态
         run: |
-          go build -trimpath -ldflags "-s -w" -o bin/xdrop-agent .
+          chmod +x scripts/build-node.sh
+          ./scripts/build-node.sh agent
 
-      - name: Rename output
+      - name: Verify architecture
         run: |
-          mv bin/xdrop-agent \
-             bin/xdrop-agent-linux-${{ matrix.arch }}-${{ matrix.libc }}
+          BIN="node/xdrop-agent"
+          test -f "$BIN" || { echo "::error::$BIN not found"; ls -la node/; exit 1; }
+          file "$BIN"
+          case "${{ matrix.goarch }}" in
+            amd64) file "$BIN" | grep -q "x86-64"  || { echo "::error::expected x86-64";  exit 1; } ;;
+            arm64) file "$BIN" | grep -q "aarch64" || { echo "::error::expected aarch64"; exit 1; } ;;
+          esac
+
+      - name: Stage bundle (agent + ELFs)
+        run: |
+          mkdir -p dist/bundle
+          cp node/xdrop-agent              dist/bundle/xdrop-agent
+          cp node/bpf/xdrop_main.elf       dist/bundle/
+          cp node/bpf/xdrop_gate.elf       dist/bundle/
+          # 打包成 tar,保证 ELF 与 agent 一起分发
+          tar -C dist/bundle -czf \
+            dist/xdrop-node-linux-${{ matrix.arch }}.tar.gz \
+            xdrop-agent xdrop_main.elf xdrop_gate.elf
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: xdrop-agent-linux-${{ matrix.arch }}-${{ matrix.libc }}
-          path: node/agent/bin/xdrop-agent-linux-${{ matrix.arch }}-${{ matrix.libc }}
+          name: xdrop-node-linux-${{ matrix.arch }}
+          path: dist/xdrop-node-linux-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
 
   # ============================================================
-  # 4. 汇总所有产物
+  # 4. 汇总
   # ============================================================
   release-artifacts:
     name: Collect All Artifacts
