@@ -1,0 +1,240 @@
+name: XDrop Multi-Arch Multi-Libc Build
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ============================================================
+  # 1. Go Controller —— x86_64 / aarch64, glibc / musl
+  #    XDrop Controller 通常不需要 CGO,可静态编译
+  # ============================================================
+  build-controller:
+    name: Build Go Controller (${{ matrix.arch }}-${{ matrix.libc }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            goarch: amd64
+            libc: glibc
+            cgo: "0"
+            cc: gcc
+            runner: ubuntu-latest
+          - arch: amd64
+            goarch: amd64
+            libc: musl
+            cgo: "0"
+            cc: musl-gcc
+            runner: ubuntu-latest
+          - arch: arm64
+            goarch: arm64
+            libc: glibc
+            cgo: "0"
+            cc: gcc
+            runner: ubuntu-24.04-arm
+          - arch: arm64
+            goarch: arm64
+            libc: musl
+            cgo: "0"
+            cc: musl-gcc
+            runner: ubuntu-24.04-arm
+
+    defaults:
+      run:
+        working-directory: ./controller
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          check-latest: true
+          cache: true
+          cache-dependency-path: controller/go.sum
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: controller/web/package-lock.json
+
+      - name: Build frontend
+        working-directory: ./controller/web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build Controller
+        env:
+          CGO_ENABLED: ${{ matrix.cgo }}
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          go build -trimpath -ldflags "-s -w" -o bin/xdrop-controller ./cmd
+
+      - name: Rename output
+        run: |
+          mv bin/xdrop-controller \
+             bin/xdrop-controller-linux-${{ matrix.arch }}-${{ matrix.libc }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xdrop-controller-linux-${{ matrix.arch }}-${{ matrix.libc }}
+          path: controller/bin/xdrop-controller-linux-${{ matrix.arch }}-${{ matrix.libc }}
+
+  # ============================================================
+  # 2. BPF 数据面 —— clang 编译为架构无关的 eBPF 对象
+  #    BPF 字节码不区分 arch/libc,仅编译一次
+  # ============================================================
+  build-bpf:
+    name: Build BPF Object
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./node/bpf
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install BPF toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang llvm libbpf-dev libelf-dev \
+            linux-libc-dev linux-tools-common build-essential
+
+      - name: Generate vmlinux.h
+        run: |
+          sudo apt-get install -y bpftool || true
+          if [ ! -f /sys/kernel/btf/vmlinux ]; then
+            echo "::error::No BTF on runner kernel"; exit 1
+          fi
+          bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h
+
+      - name: Build BPF
+        run: make
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xdrop-bpf-object
+          path: node/bpf/*.o
+
+  # ============================================================
+  # 3. Go Node Agent —— x86_64 / aarch64, glibc / musl
+  #    Agent 需要 CGO(链接 libbpf),因此区分 libc
+  # ============================================================
+  build-agent:
+    name: Build Go Agent (${{ matrix.arch }}-${{ matrix.libc }})
+    runs-on: ${{ matrix.runner }}
+    needs: [build-bpf]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            goarch: amd64
+            libc: glibc
+            cgo: "1"
+            cc: gcc
+            runner: ubuntu-latest
+          - arch: amd64
+            goarch: amd64
+            libc: musl
+            cgo: "1"
+            cc: musl-gcc
+            runner: ubuntu-latest
+          - arch: arm64
+            goarch: arm64
+            libc: glibc
+            cgo: "1"
+            cc: gcc
+            runner: ubuntu-24.04-arm
+          - arch: arm64
+            goarch: arm64
+            libc: musl
+            cgo: "1"
+            cc: musl-gcc
+            runner: ubuntu-24.04-arm
+
+    defaults:
+      run:
+        working-directory: ./node/agent
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download BPF object
+        uses: actions/download-artifact@v4
+        with:
+          name: xdrop-bpf-object
+          path: node/bpf
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          check-latest: true
+          cache: true
+          cache-dependency-path: node/agent/go.sum
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang llvm libbpf-dev libelf-dev pkg-config \
+            linux-libc-dev build-essential zlib1g-dev musl-tools
+
+      - name: Build Agent
+        env:
+          CGO_ENABLED: ${{ matrix.cgo }}
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          CC: ${{ matrix.cc }}
+          CGO_CFLAGS: "-I/usr/include -I${{ matrix.arch == 'arm64' && '/usr/include/aarch64-linux-gnu' || '/usr/include/x86_64-linux-gnu' }}"
+          CGO_LDFLAGS: "-lelf -lz"
+        run: |
+          go build -trimpath -ldflags "-s -w" -o bin/xdrop-agent .
+
+      - name: Rename output
+        run: |
+          mv bin/xdrop-agent \
+             bin/xdrop-agent-linux-${{ matrix.arch }}-${{ matrix.libc }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xdrop-agent-linux-${{ matrix.arch }}-${{ matrix.libc }}
+          path: node/agent/bin/xdrop-agent-linux-${{ matrix.arch }}-${{ matrix.libc }}
+
+  # ============================================================
+  # 4. 汇总所有产物
+  # ============================================================
+  release-artifacts:
+    name: Collect All Artifacts
+    needs: [build-controller, build-agent]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: all-artifacts
+
+      - name: List artifacts
+        run: find all-artifacts -type f -exec ls -lh {} \;
+
+      - name: Upload combined bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: xdrop-all-binaries
+          path: all-artifacts
