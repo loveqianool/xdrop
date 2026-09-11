@@ -1,224 +1,277 @@
-name: XDrop Multi-Arch Build
+name: Release
 
 on:
   push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
+    branches: [main, master]
+    tags: ['v*']
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 env:
-  CARGO_TERM_COLOR: always
+  GO_VERSION: '1.24'
+  NODE_VERSION: '20'
 
 jobs:
-  # ============================================================
-  # 1. Go Controller —— x86_64 / aarch64
-  #    纯 Go,CGO_ENABLED=0,静态二进制
-  # ============================================================
-  build-controller:
-    name: Build Controller (${{ matrix.arch }})
+  # ─────────────────────────────────────────────────────────────
+  # 1. Controller — 四象限（mattn/go-sqlite3 需 CGO）
+  #    在对应架构 runner 原生编译，musl 用 musl-gcc 静态链接
+  # ─────────────────────────────────────────────────────────────
+  controller:
+    name: Controller (${{ matrix.arch }}-${{ matrix.libc }})
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
+          # amd64
           - arch: amd64
             goarch: amd64
-            runner: ubuntu-latest
+            libc: glibc
+            runner: ubuntu-22.04
+            cc: gcc
+            static_flags: ''
+          - arch: amd64
+            goarch: amd64
+            libc: musl
+            runner: ubuntu-22.04
+            cc: musl-gcc
+            static_flags: "-linkmode external -extldflags '-static'"
+
+          # arm64
           - arch: arm64
             goarch: arm64
-            runner: ubuntu-24.04-arm
+            libc: glibc
+            runner: ubuntu-22.04-arm
+            cc: gcc
+            static_flags: ''
+          - arch: arm64
+            goarch: arm64
+            libc: musl
+            runner: ubuntu-22.04-arm
+            cc: musl-gcc
+            static_flags: "-linkmode external -extldflags '-static'"
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Go
-        uses: actions/setup-go@v5
+      - uses: actions/setup-go@v5
         with:
-          go-version: '1.24'
-          check-latest: true
-          cache: true
+          go-version: ${{ env.GO_VERSION }}
           cache-dependency-path: controller/go.sum
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: '20'
-          cache: 'npm'
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
           cache-dependency-path: controller/web/package-lock.json
 
-      - name: Build Controller (via project script)
+      - name: Install CGO build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc libc6-dev musl-tools
+
+      - name: Build frontend
+        working-directory: controller/web
+        run: |
+          npm ci
+          npm run build
+
+      # musl 静态链接需要显式指定 -static，glibc 不需要
+      - name: Build controller binary
+        working-directory: controller
         env:
           GOOS: linux
           GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: "0"
+          CGO_ENABLED: '1'
+          CC: ${{ matrix.cc }}
+          CGO_LDFLAGS: ${{ matrix.libc == 'musl' && '-static' || '' }}
         run: |
-          chmod +x scripts/build-controller.sh
-          ./scripts/build-controller.sh
+          go build -trimpath \
+            -ldflags "-s -w -X main.version=${GITHUB_REF_NAME:-dev} ${{ matrix.static_flags }}" \
+            -o ../dist/xdrop-controller-linux-${{ matrix.arch }}-${{ matrix.libc }} \
+            ./cmd/controller
 
-      - name: Verify architecture
+      # 校验 musl 产物确实是静态链接（防止误出 glibc 版）
+      - name: Verify linkage
+        if: matrix.libc == 'musl'
         run: |
-          BIN="controller/xdrop-controller"
-          test -f "$BIN" || { echo "::error::$BIN not found"; ls -la controller/; exit 1; }
-          file "$BIN"
-          case "${{ matrix.goarch }}" in
-            amd64) file "$BIN" | grep -q "x86-64"  || { echo "::error::expected x86-64";  exit 1; } ;;
-            arm64) file "$BIN" | grep -q "aarch64" || { echo "::error::expected aarch64"; exit 1; } ;;
-          esac
+          file dist/xdrop-controller-linux-${{ matrix.arch }}-musl
+          if ! file dist/xdrop-controller-linux-${{ matrix.arch }}-musl | grep -q "statically linked"; then
+            echo "ERROR: musl build is not statically linked"
+            exit 1
+          fi
 
-      - name: Rename output
-        run: |
-          mkdir -p dist
-          cp controller/xdrop-controller dist/xdrop-controller-linux-${{ matrix.arch }}
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: xdrop-controller-linux-${{ matrix.arch }}
-          path: dist/xdrop-controller-linux-${{ matrix.arch }}
+          name: controller-${{ matrix.arch }}-${{ matrix.libc }}
+          path: dist/xdrop-controller-*
+          if-no-files-found: error
 
-  # ============================================================
-  # 2. BPF 对象 —— 架构无关,只编译一次
-  #    产出 xdrop_main.elf + xdrop_gate.elf
-  # ============================================================
-  build-bpf:
-    name: Build BPF Objects
-    runs-on: ubuntu-latest
+  # ─────────────────────────────────────────────────────────────
+  # 2. Node Agent — 四象限（BPF + Go CGO）
+  # ─────────────────────────────────────────────────────────────
+  node-agent:
+    name: Node Agent (${{ matrix.arch }}-${{ matrix.libc }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # amd64
+          - arch: amd64
+            goarch: amd64
+            libc: glibc
+            runner: ubuntu-22.04
+            cc: gcc
+            static_flags: ''
+          - arch: amd64
+            goarch: amd64
+            libc: musl
+            runner: ubuntu-22.04
+            cc: musl-gcc
+            static_flags: "-linkmode external -extldflags '-static'"
+
+          # arm64
+          - arch: arm64
+            goarch: arm64
+            libc: glibc
+            runner: ubuntu-22.04-arm
+            cc: gcc
+            static_flags: ''
+          - arch: arm64
+            goarch: arm64
+            libc: musl
+            runner: ubuntu-22.04-arm
+            cc: musl-gcc
+            static_flags: "-linkmode external -extldflags '-static'"
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install BPF toolchain
+      - name: Install build deps
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            clang llvm libbpf-dev libelf-dev pkg-config \
-            linux-libc-dev build-essential
+            clang llvm make bpftool \
+            linux-libc-dev libbpf-dev \
+            libelf-dev zlib1g-dev \
+            gcc musl-tools
 
-      - name: Install bpftool (static, kernel-independent)
-        run: |
-          BPFTOOL_VERSION=v7.5.0
-          curl -sL "https://github.com/libbpf/bpftool/releases/download/${BPFTOOL_VERSION}/bpftool-${BPFTOOL_VERSION}-amd64.tar.gz" \
-            | tar -xz
-          sudo mv bpftool /usr/local/bin/bpftool
-          sudo chmod +x /usr/local/bin/bpftool
-          bpftool version
-
-      - name: Generate vmlinux.h
-        run: |
-          test -f /sys/kernel/btf/vmlinux || { echo "::error::no BTF on runner"; exit 1; }
-          bpftool btf dump file /sys/kernel/btf/vmlinux format c > node/bpf/vmlinux.h
-
-      - name: Build BPF (via project script)
-        run: |
-          chmod +x scripts/build-node.sh
-          ./scripts/build-node.sh bpf
-
-      - name: Verify ELFs
-        run: |
-          for f in node/bpf/xdrop_main.elf node/bpf/xdrop_gate.elf; do
-            test -f "$f" || { echo "::error::$f missing"; exit 1; }
-            file "$f"
-          done
-
-      - name: Upload BPF artifacts
-        uses: actions/upload-artifact@v4
+      - uses: actions/setup-go@v5
         with:
-          name: xdrop-bpf-elf
-          path: |
-            node/bpf/xdrop_main.elf
-            node/bpf/xdrop_gate.elf
-          if-no-files-found: error
-
-  # ============================================================
-  # 3. Go Agent —— x86_64 / aarch64,静态编译
-  #    依赖 BPF 作业的 ELF,与 ELF 一起打包
-  # ============================================================
-  build-agent:
-    name: Build Agent (${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
-    needs: [build-bpf]
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            goarch: amd64
-            runner: ubuntu-latest
-          - arch: arm64
-            goarch: arm64
-            runner: ubuntu-24.04-arm
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download BPF ELFs
-        uses: actions/download-artifact@v4
-        with:
-          name: xdrop-bpf-elf
-          path: node/bpf
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.24'
-          check-latest: true
-          cache: true
+          go-version: ${{ env.GO_VERSION }}
           cache-dependency-path: node/agent/go.sum
 
-      - name: Build Agent (via project script)
+      # ── 生成 vmlinux.h（仓库里没有） ──
+      - name: Generate vmlinux.h
+        working-directory: node/bpf
+        run: |
+          if [ -f vmlinux.h ]; then
+            echo "vmlinux.h already present, skip"
+          else
+            if bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h 2>/dev/null; then
+              echo "Generated from runner kernel BTF"
+            else
+              echo "Fallback: downloading from libbpf/vmlinux.h"
+              curl -fsSL \
+                https://raw.githubusercontent.com/libbpf/vmlinux.h/main/vmlinux.h \
+                -o vmlinux.h
+            fi
+          fi
+          head -5 vmlinux.h
+
+      # ── 编译 BPF 程序 ──
+      # 注意：node/Makefile 是 `make -C bpf`，不暴露 CC/ARCH。
+      # 通过 env 传 MAKEFLAGS，需 bpf/Makefile 里用 $(CC) / $(ARCH) 才能覆盖。
+      - name: Build BPF objects
+        working-directory: node
+        env:
+          CC: clang
+          ARCH: ${{ matrix.arch == 'arm64' && 'arm64' || 'x86' }}
+        run: make bpf
+
+      # ── 编译 Go agent ──
+      - name: Build node agent
+        working-directory: node/agent
         env:
           GOOS: linux
           GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: "0"          # cilium/ebpf —— 纯 Go,静态
+          CGO_ENABLED: '1'
+          CC: ${{ matrix.cc }}
+          CGO_LDFLAGS: ${{ matrix.libc == 'musl' && '-static' || '' }}
         run: |
-          chmod +x scripts/build-node.sh
-          ./scripts/build-node.sh agent
+          go build -trimpath \
+            -ldflags "-s -w -X main.version=${GITHUB_REF_NAME:-dev} ${{ matrix.static_flags }}" \
+            -o ../../dist/xdrop-agent-linux-${{ matrix.arch }}-${{ matrix.libc }} \
+            .
 
-      - name: Verify architecture
+      - name: Verify linkage
+        if: matrix.libc == 'musl'
         run: |
-          BIN="node/xdrop-agent"
-          test -f "$BIN" || { echo "::error::$BIN not found"; ls -la node/; exit 1; }
-          file "$BIN"
-          case "${{ matrix.goarch }}" in
-            amd64) file "$BIN" | grep -q "x86-64"  || { echo "::error::expected x86-64";  exit 1; } ;;
-            arm64) file "$BIN" | grep -q "aarch64" || { echo "::error::expected aarch64"; exit 1; } ;;
-          esac
+          file dist/xdrop-agent-linux-${{ matrix.arch }}-musl
+          if ! file dist/xdrop-agent-linux-${{ matrix.arch }}-musl | grep -q "statically linked"; then
+            echo "ERROR: musl build is not statically linked"
+            exit 1
+          fi
 
-      - name: Stage bundle (agent + ELFs)
+      # BPF .elf 按架构打包（.elf 与 libc 无关，去重）
+      - name: Package artifacts
         run: |
-          mkdir -p dist/bundle
-          cp node/xdrop-agent              dist/bundle/xdrop-agent
-          cp node/bpf/xdrop_main.elf       dist/bundle/
-          cp node/bpf/xdrop_gate.elf       dist/bundle/
-          # 打包成 tar,保证 ELF 与 agent 一起分发
-          tar -C dist/bundle -czf \
-            dist/xdrop-node-linux-${{ matrix.arch }}.tar.gz \
-            xdrop-agent xdrop_main.elf xdrop_gate.elf
+          ARCH_DIR=${{ matrix.arch == 'arm64' && 'arm64' || 'x86_64' }}
+          mkdir -p dist/bpf-${ARCH_DIR}
+          cp node/bpf/*.elf dist/bpf-${ARCH_DIR}/ 2>/dev/null || true
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: xdrop-node-linux-${{ matrix.arch }}
-          path: dist/xdrop-node-linux-${{ matrix.arch }}.tar.gz
+          name: node-agent-${{ matrix.arch }}-${{ matrix.libc }}
+          path: dist/
           if-no-files-found: error
 
-  # ============================================================
-  # 4. 汇总
-  # ============================================================
-  release-artifacts:
-    name: Collect All Artifacts
-    needs: [build-controller, build-agent]
-    runs-on: ubuntu-latest
+  # ─────────────────────────────────────────────────────────────
+  # 3. 发布 Release（latest）
+  # ─────────────────────────────────────────────────────────────
+  release:
+    name: Publish Release
+    needs: [controller, node-agent]
+    runs-on: ubuntu-22.04
+    if: github.event_name != 'pull_request'
+
     steps:
       - uses: actions/download-artifact@v4
         with:
-          path: all-artifacts
+          path: artifacts/
+          merge-multiple: true
 
       - name: List artifacts
-        run: find all-artifacts -type f -exec ls -lh {} \;
+        run: find artifacts/ -type f -exec ls -lh {} \;
 
-      - name: Upload combined bundle
-        uses: actions/upload-artifact@v4
+      - name: Generate checksums
+        working-directory: artifacts
+        run: |
+          find . -type f ! -name 'checksums.txt' -exec sha256sum {} \; \
+            | sed 's|\./||' | sort -k2 > checksums.txt
+          cat checksums.txt
+
+      - name: Compute release tag
+        id: tag
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "tag=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=latest-$(date +%Y%m%d-%H%M%S)" >> $GITHUB_OUTPUT
+          fi
+
+      - uses: softprops/action-gh-release@v2
         with:
-          name: xdrop-all-binaries
-          path: all-artifacts
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
+          generate_release_notes: true
+          make_latest: true
+          files: |
+            artifacts/xdrop-controller-*
+            artifacts/xdrop-agent-*
+            artifacts/bpf-*/**
+            artifacts/checksums.txt
+          fail_on_unmatched_files: false
