@@ -256,8 +256,7 @@ jobs:
 
   # ─────────────────────────────────────────────────────────────
   # 3. Docker 镜像 — 多平台，推 ghcr.io
-  #    scratch 基础镜像 + musl 静态二进制
-  #    Node 镜像带 BPF ELF（agent 从磁盘读，非 embed）
+  #    scratch + musl 静态二进制 + CA 证书 + BPF ELF
   # ─────────────────────────────────────────────────────────────
   docker:
     name: Docker (${{ matrix.image }})
@@ -279,7 +278,6 @@ jobs:
           path: artifacts/
           merge-multiple: true
 
-      # download-artifact 有时会丢权限位，重新加回
       - name: Restore executable bits
         run: |
           chmod +x artifacts/xdrop-controller-* 2>/dev/null || true
@@ -291,6 +289,10 @@ jobs:
           set -euo pipefail
           mkdir -p docker-ctx/${{ matrix.image }}
 
+          # ── 复制系统 CA 证书（所有镜像都需要，避免 TLS 验证失败）──
+          # Ubuntu runner 上的 ca-certificates 包提供这个文件
+          cp /etc/ssl/certs/ca-certificates.crt docker-ctx/${{ matrix.image }}/ca-certificates.crt
+
           if [ "${{ matrix.image }}" = "controller" ]; then
             cp artifacts/xdrop-controller-linux-amd64-musl \
                docker-ctx/controller/xdrop-controller-amd64
@@ -300,18 +302,18 @@ jobs:
           FROM scratch
           ARG TARGETARCH
           COPY --chmod=0755 xdrop-controller-${TARGETARCH} /xdrop-controller
+          COPY --chmod=0644 ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
           EXPOSE 8000
           VOLUME ["/data"]
           ENTRYPOINT ["/xdrop-controller"]
           EOF
           else
-            # agent 二进制
             cp artifacts/xdrop-agent-linux-amd64-musl \
                docker-ctx/node/xdrop-agent-amd64
             cp artifacts/xdrop-agent-linux-arm64-musl \
                docker-ctx/node/xdrop-agent-arm64
 
-            # BPF ELF 按架构分目录（x86_64 → amd64，arm64 → arm64）
+            # BPF ELF 按架构分目录
             mkdir -p docker-ctx/node/amd64 docker-ctx/node/arm64
             cp artifacts/bpf-x86_64/xdrop_main.elf docker-ctx/node/amd64/
             cp artifacts/bpf-x86_64/xdrop_gate.elf docker-ctx/node/amd64/
@@ -324,6 +326,7 @@ jobs:
           COPY --chmod=0755 xdrop-agent-${TARGETARCH} /xdrop-agent
           COPY --chmod=0644 ${TARGETARCH}/xdrop_main.elf /bpf/xdrop_main.elf
           COPY --chmod=0644 ${TARGETARCH}/xdrop_gate.elf /bpf/xdrop_gate.elf
+          COPY --chmod=0644 ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
           # 运行要求：
           #   --network host
           #   --cap-add=BPF,NET_ADMIN,PERFMON,SYS_RESOURCE
