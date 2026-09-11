@@ -257,6 +257,7 @@ jobs:
   # ─────────────────────────────────────────────────────────────
   # 3. Docker 镜像 — 多平台，推 ghcr.io
   #    scratch 基础镜像 + musl 静态二进制
+  #    Node 镜像带 BPF ELF（agent 从磁盘读，非 embed）
   # ─────────────────────────────────────────────────────────────
   docker:
     name: Docker (${{ matrix.image }})
@@ -278,7 +279,7 @@ jobs:
           path: artifacts/
           merge-multiple: true
 
-      # 下载后必须重新 chmod +x —— download-artifact 有时会丢权限位
+      # download-artifact 有时会丢权限位，重新加回
       - name: Restore executable bits
         run: |
           chmod +x artifacts/xdrop-controller-* 2>/dev/null || true
@@ -304,25 +305,36 @@ jobs:
           ENTRYPOINT ["/xdrop-controller"]
           EOF
           else
+            # agent 二进制
             cp artifacts/xdrop-agent-linux-amd64-musl \
                docker-ctx/node/xdrop-agent-amd64
             cp artifacts/xdrop-agent-linux-arm64-musl \
                docker-ctx/node/xdrop-agent-arm64
-            # BPF ELF 已通过 go:embed 内嵌在二进制里，无需单独 COPY
+
+            # BPF ELF 按架构分目录（x86_64 → amd64，arm64 → arm64）
+            mkdir -p docker-ctx/node/amd64 docker-ctx/node/arm64
+            cp artifacts/bpf-x86_64/xdrop_main.elf docker-ctx/node/amd64/
+            cp artifacts/bpf-x86_64/xdrop_gate.elf docker-ctx/node/amd64/
+            cp artifacts/bpf-arm64/xdrop_main.elf  docker-ctx/node/arm64/
+            cp artifacts/bpf-arm64/xdrop_gate.elf  docker-ctx/node/arm64/
+
             cat > docker-ctx/node/Dockerfile <<'EOF'
           FROM scratch
           ARG TARGETARCH
           COPY --chmod=0755 xdrop-agent-${TARGETARCH} /xdrop-agent
+          COPY --chmod=0644 ${TARGETARCH}/xdrop_main.elf /bpf/xdrop_main.elf
+          COPY --chmod=0644 ${TARGETARCH}/xdrop_gate.elf /bpf/xdrop_gate.elf
           # 运行要求：
           #   --network host
           #   --cap-add=BPF,NET_ADMIN,PERFMON,SYS_RESOURCE
           #   -v /sys/fs/bpf:/sys/fs/bpf
           #   -v /sys/kernel/btf:/sys/kernel/btf:ro
+          # 配置里 bpf.main_path/gate_path 指向 /bpf/*.elf
           ENTRYPOINT ["/xdrop-agent"]
           EOF
           fi
 
-          echo "=== docker-ctx ==="
+          echo "=== docker-ctx tree ==="
           find docker-ctx -type f -exec ls -l {} \;
 
       - name: Set up QEMU
