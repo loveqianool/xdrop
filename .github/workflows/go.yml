@@ -16,7 +16,6 @@ env:
 jobs:
   # ─────────────────────────────────────────────────────────────
   # 1. Controller — 四象限（mattn/go-sqlite3 需 CGO）
-  #    在对应架构 runner 原生编译，musl 用 musl-gcc 静态链接
   # ─────────────────────────────────────────────────────────────
   controller:
     name: Controller (${{ matrix.arch }}-${{ matrix.libc }})
@@ -25,7 +24,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # amd64
           - arch: amd64
             goarch: amd64
             libc: glibc
@@ -38,8 +36,6 @@ jobs:
             runner: ubuntu-22.04
             cc: musl-gcc
             static_flags: "-linkmode external -extldflags '-static'"
-
-          # arm64
           - arch: arm64
             goarch: arm64
             libc: glibc
@@ -117,7 +113,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # amd64
           - arch: amd64
             goarch: amd64
             libc: glibc
@@ -130,8 +125,6 @@ jobs:
             runner: ubuntu-22.04
             cc: musl-gcc
             static_flags: "-linkmode external -extldflags '-static'"
-
-          # arm64
           - arch: arm64
             goarch: arm64
             libc: glibc
@@ -148,7 +141,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 注意：不再安装 bpftool（Ubuntu 22.04 上是虚拟包，装不了）
       - name: Install build deps
         run: |
           sudo apt-get update
@@ -157,30 +149,65 @@ jobs:
             linux-libc-dev libbpf-dev \
             libelf-dev zlib1g-dev \
             gcc musl-tools \
-            curl
+            linux-tools-common linux-tools-generic
+
+      # 修复 bpftool 在 Ubuntu 22.04 / Azure 内核上的已知问题
+      - name: Ensure bpftool works
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if /usr/sbin/bpftool -V >/dev/null 2>&1; then
+            echo "bpftool works"
+            exit 0
+          fi
+
+          echo "bpftool broken, installing fallback..."
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends linux-tools-generic
+
+          KREL="$(uname -r)"
+          FALLBACK="$(find /usr/lib -type f -name bpftool -perm -111 2>/dev/null | sort -V | tail -n 1)"
+
+          if [ -z "$FALLBACK" ]; then
+            echo "ERROR: no bpftool payload found"
+            exit 1
+          fi
+
+          sudo mkdir -p "/usr/lib/linux-tools/${KREL}"
+          sudo ln -sf "$FALLBACK" "/usr/lib/linux-tools/${KREL}/bpftool"
+
+          /usr/sbin/bpftool -V
 
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
           cache-dependency-path: node/agent/go.sum
 
-      # ── 获取 vmlinux.h ──
-      # 仓库里没有，直接从 libbpf/vmlinux.h 拉预生成版本（不依赖 bpftool）
-      - name: Fetch vmlinux.h
+      # ── 生成 vmlinux.h（从运行内核 BTF dump） ──
+      - name: Generate vmlinux.h
         working-directory: node/bpf
         run: |
           if [ -f vmlinux.h ]; then
             echo "vmlinux.h already present, skip"
-          else
-            curl -fsSL \
-              https://raw.githubusercontent.com/libbpf/vmlinux.h/main/vmlinux.h \
-              -o vmlinux.h
+            exit 0
           fi
+
+          if [ ! -f /sys/kernel/btf/vmlinux ]; then
+            echo "ERROR: /sys/kernel/btf/vmlinux not found."
+            echo "Runner kernel lacks BTF (CONFIG_DEBUG_INFO_BTF=y)."
+            echo "Please commit vmlinux.h to the repository instead."
+            exit 1
+          fi
+
+          sudo bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h
+
+          echo "=== vmlinux.h preview ==="
           head -5 vmlinux.h
+          echo "=== size ==="
+          wc -l vmlinux.h
 
       # ── 编译 BPF 程序 ──
-      # node/Makefile 是 `make -C bpf`，通过 env 传 CC/ARCH。
-      # 需 bpf/Makefile 里用 $(CC) / $(ARCH) 引用才能覆盖。
       - name: Build BPF objects
         working-directory: node
         env:
@@ -212,7 +239,7 @@ jobs:
             exit 1
           fi
 
-      # BPF .elf 按架构打包（.elf 与 libc 无关，去重）
+      # BPF .elf 按架构打包（.elf 与 libc 无关）
       - name: Package artifacts
         run: |
           ARCH_DIR=${{ matrix.arch == 'arm64' && 'arm64' || 'x86_64' }}
