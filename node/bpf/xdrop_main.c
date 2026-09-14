@@ -17,6 +17,7 @@ BPF_MAP_DEF(blacklist) = {
     .key_size = sizeof(struct rule_key),
     .value_size = sizeof(struct rule_value),
     .max_entries = MAX_RULES,
+    .map_flags = BPF_F_NO_PREALLOC,
 };
 BPF_MAP_ADD(blacklist);
 
@@ -28,6 +29,7 @@ BPF_MAP_DEF(whitelist) = {
     .key_size = sizeof(struct rule_key),
     .value_size = sizeof(__u8),
     .max_entries = MAX_WHITELIST,
+    .map_flags = BPF_F_NO_PREALLOC,
 };
 BPF_MAP_ADD(whitelist);
 
@@ -88,6 +90,7 @@ BPF_MAP_DEF(rl_states) = {
     .key_size = sizeof(struct rule_key),
     .value_size = sizeof(struct rate_limit_state),
     .max_entries = MAX_RULES,
+    .map_flags = BPF_F_NO_PREALLOC,
 };
 BPF_MAP_ADD(rl_states);
 
@@ -139,6 +142,7 @@ BPF_MAP_DEF(cidr_blacklist) = {
     .key_size = sizeof(struct cidr_rule_key),
     .value_size = sizeof(struct rule_value),
     .max_entries = MAX_RULES,
+    .map_flags = BPF_F_NO_PREALLOC,
 };
 BPF_MAP_ADD(cidr_blacklist);
 
@@ -148,6 +152,7 @@ BPF_MAP_DEF(cidr_rl_states) = {
     .key_size = sizeof(struct cidr_rule_key),
     .value_size = sizeof(struct rate_limit_state),
     .max_entries = MAX_RULES,
+    .map_flags = BPF_F_NO_PREALLOC,
 };
 BPF_MAP_ADD(cidr_rl_states);
 
@@ -159,6 +164,7 @@ BPF_MAP_DEF(blacklist_b) = {
     .key_size = sizeof(struct rule_key),
     .value_size = sizeof(struct rule_value),
     .max_entries = MAX_RULES,
+    .map_flags = BPF_F_NO_PREALLOC,
 };
 BPF_MAP_ADD(blacklist_b);
 
@@ -168,6 +174,7 @@ BPF_MAP_DEF(cidr_blist_b) = {
     .key_size = sizeof(struct cidr_rule_key),
     .value_size = sizeof(struct rule_value),
     .max_entries = MAX_RULES,
+    .map_flags = BPF_F_NO_PREALLOC,
 };
 BPF_MAP_ADD(cidr_blist_b);
 
