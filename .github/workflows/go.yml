@@ -159,7 +159,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-
+      - name: Install CGO build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc libc6-dev musl-tools
       # ── BPF 编译：不走 make，直接 clang，避免改 Makefile ──
       - name: Build BPF objects in Alpine container
         env:
