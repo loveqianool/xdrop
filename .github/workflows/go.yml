@@ -190,10 +190,7 @@ jobs:
 
               CFLAGS="-O2 -g -Wall -target bpf -D__BPF__ -I./headers -D__TARGET_ARCH_${ARCH}"
 
-              echo "clang $CFLAGS -c xdrop_main.c -o xdrop_main.elf"
               clang $CFLAGS -c xdrop_main.c -o xdrop_main.elf
-
-              echo "clang $CFLAGS -c xdrop_gate.c -o xdrop_gate.elf"
               clang $CFLAGS -c xdrop_gate.c -o xdrop_gate.elf
 
               echo "=== BPF objects built ==="
@@ -247,6 +244,7 @@ jobs:
           fi
           ls -l dist/xdrop-agent-linux-${{ matrix.arch }}-${{ matrix.libc }}
 
+      # 把 BPF ELF 复制到 dist/bpf-<arch>/ 子目录
       - name: Package BPF artifacts
         run: |
           set -euo pipefail
@@ -262,13 +260,13 @@ jobs:
           path: dist/xdrop-agent-linux-${{ matrix.arch }}-${{ matrix.libc }}
           if-no-files-found: error
 
-      # ▼ 注意：path 末尾不带 /，让 artifact 内部保留 bpf-x86_64/ 或 bpf-arm64/ 子目录
+      # 上传 dist/（父目录），让 artifact 内部保留 bpf-<arch>/ 这层
       - name: Upload BPF objects
         if: matrix.libc == 'musl'
         uses: actions/upload-artifact@v4
         with:
           name: bpf-${{ matrix.arch == 'arm64' && 'arm64' || 'x86_64' }}
-          path: dist/bpf-${{ matrix.arch == 'arm64' && 'arm64' || 'x86_64' }}
+          path: dist/bpf-${{ matrix.arch == 'arm64' && 'arm64' || 'x86_64' }}/
           if-no-files-found: error
 
   # ─────────────────────────────────────────────────────────────
@@ -288,11 +286,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 关键：不加 merge-multiple，让每个 artifact 独立成子目录
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts/
-          merge-multiple: true
 
       - name: Show artifact tree
         run: |
@@ -301,8 +299,8 @@ jobs:
 
       - name: Restore executable bits
         run: |
-          chmod +x artifacts/xdrop-controller-* 2>/dev/null || true
-          chmod +x artifacts/xdrop-agent-* 2>/dev/null || true
+          find artifacts/ -name 'xdrop-controller-*' -exec chmod +x {} \;
+          find artifacts/ -name 'xdrop-agent-*' -exec chmod +x {} \;
 
       - name: Prepare docker context
         run: |
@@ -312,9 +310,9 @@ jobs:
           cp /etc/ssl/certs/ca-certificates.crt docker-ctx/${{ matrix.image }}/ca-certificates.crt
 
           if [ "${{ matrix.image }}" = "controller" ]; then
-            cp artifacts/xdrop-controller-linux-amd64-musl \
+            cp artifacts/controller-amd64-musl/xdrop-controller-linux-amd64-musl \
                docker-ctx/controller/xdrop-controller-amd64
-            cp artifacts/xdrop-controller-linux-arm64-musl \
+            cp artifacts/controller-arm64-musl/xdrop-controller-linux-arm64-musl \
                docker-ctx/controller/xdrop-controller-arm64
             cat > docker-ctx/controller/Dockerfile <<'EOF'
           FROM scratch
@@ -326,9 +324,9 @@ jobs:
           ENTRYPOINT ["/xdrop-controller"]
           EOF
           else
-            cp artifacts/xdrop-agent-linux-amd64-musl \
+            cp artifacts/node-agent-amd64-musl/xdrop-agent-linux-amd64-musl \
                docker-ctx/node/xdrop-agent-amd64
-            cp artifacts/xdrop-agent-linux-arm64-musl \
+            cp artifacts/node-agent-arm64-musl/xdrop-agent-linux-arm64-musl \
                docker-ctx/node/xdrop-agent-arm64
 
             mkdir -p docker-ctx/node/amd64 docker-ctx/node/arm64
@@ -404,16 +402,29 @@ jobs:
     if: github.event_name != 'pull_request'
 
     steps:
+      # 不加 merge-multiple，保留 artifact 名子目录
       - uses: actions/download-artifact@v4
         with:
           path: artifacts/
-          merge-multiple: true
 
       - name: List artifacts
         run: find artifacts/ -type f -exec ls -lh {} \;
 
+      - name: Flatten into release staging dir
+        run: |
+          set -euo pipefail
+          mkdir -p release-files
+          # 把每个 artifact 子目录里的文件平铺到 release-files/（重名会报错，所以 BPF 加前缀）
+          for f in artifacts/controller-*/*; do cp "$f" release-files/; done
+          for f in artifacts/node-agent-*/*; do cp "$f" release-files/; done
+          cp artifacts/bpf-x86_64/xdrop_main.elf release-files/xdrop_main-x86_64.elf
+          cp artifacts/bpf-x86_64/xdrop_gate.elf release-files/xdrop_gate-x86_64.elf
+          cp artifacts/bpf-arm64/xdrop_main.elf  release-files/xdrop_main-arm64.elf
+          cp artifacts/bpf-arm64/xdrop_gate.elf  release-files/xdrop_gate-arm64.elf
+          ls -l release-files/
+
       - name: Generate checksums
-        working-directory: artifacts
+        working-directory: release-files
         run: |
           find . -type f ! -name 'checksums.txt' -exec sha256sum {} \; \
             | sed 's|\./||' | sort -k2 > checksums.txt
@@ -440,17 +451,17 @@ jobs:
           prerelease: ${{ steps.tag.outputs.prerelease }}
           make_latest: ${{ steps.tag.outputs.make_latest }}
           files: |
-            artifacts/xdrop-controller-linux-amd64-glibc
-            artifacts/xdrop-controller-linux-amd64-musl
-            artifacts/xdrop-controller-linux-arm64-glibc
-            artifacts/xdrop-controller-linux-arm64-musl
-            artifacts/xdrop-agent-linux-amd64-glibc
-            artifacts/xdrop-agent-linux-amd64-musl
-            artifacts/xdrop-agent-linux-arm64-glibc
-            artifacts/xdrop-agent-linux-arm64-musl
-            artifacts/bpf-x86_64/xdrop_main.elf
-            artifacts/bpf-x86_64/xdrop_gate.elf
-            artifacts/bpf-arm64/xdrop_main.elf
-            artifacts/bpf-arm64/xdrop_gate.elf
-            artifacts/checksums.txt
+            release-files/xdrop-controller-linux-amd64-glibc
+            release-files/xdrop-controller-linux-amd64-musl
+            release-files/xdrop-controller-linux-arm64-glibc
+            release-files/xdrop-controller-linux-arm64-musl
+            release-files/xdrop-agent-linux-amd64-glibc
+            release-files/xdrop-agent-linux-amd64-musl
+            release-files/xdrop-agent-linux-arm64-glibc
+            release-files/xdrop-agent-linux-arm64-musl
+            release-files/xdrop_main-x86_64.elf
+            release-files/xdrop_gate-x86_64.elf
+            release-files/xdrop_main-arm64.elf
+            release-files/xdrop_gate-arm64.elf
+            release-files/checksums.txt
           fail_on_unmatched_files: false
