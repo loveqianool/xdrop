@@ -18,6 +18,7 @@ BPF_MAP_DEF(whitelist) = {
     .key_size = sizeof(struct rule_key),
     .value_size = sizeof(__u8),
     .max_entries = MAX_WHITELIST,
+    .map_flags = BPF_F_NO_PREALLOC,
 };
 BPF_MAP_ADD(whitelist);
 
@@ -77,6 +78,7 @@ BPF_MAP_DEF(whitelist_b) = {
     .key_size = sizeof(struct rule_key),
     .value_size = sizeof(__u8),
     .max_entries = MAX_WHITELIST,
+    .map_flags = BPF_F_NO_PREALLOC,
 };
 BPF_MAP_ADD(whitelist_b);
 
