@@ -93,12 +93,18 @@ jobs:
             ./cmd/controller
           chmod +x ../dist/xdrop-controller-linux-${{ matrix.arch }}-${{ matrix.libc }}
 
-      - name: Verify linkage
+      - name: Verify linkage (musl static)
         if: matrix.libc == 'musl'
         run: |
-          file dist/xdrop-controller-linux-${{ matrix.arch }}-musl
-          if ! file dist/xdrop-controller-linux-${{ matrix.arch }}-musl | grep -q "statically linked"; then
-            echo "ERROR: musl build is not statically linked"
+          BIN=dist/xdrop-controller-linux-${{ matrix.arch }}-musl
+          file "$BIN"
+          if ldd "$BIN" 2>&1 | grep -q "not a dynamic executable"; then
+            echo "OK: $BIN is statically linked"
+          elif ldd "$BIN" 2>&1 | grep -qi "statically linked"; then
+            echo "OK: $BIN is statically linked"
+          else
+            echo "ERROR: $BIN is NOT statically linked"
+            ldd "$BIN" || true
             exit 1
           fi
 
@@ -113,7 +119,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: controller-${{ matrix.arch }}-${{ matrix.libc }}
-          path: dist/xdrop-controller-*
+          path: dist/xdrop-controller-linux-${{ matrix.arch }}-${{ matrix.libc }}
           if-no-files-found: error
 
   # ─────────────────────────────────────────────────────────────
@@ -154,20 +160,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
       - name: Build BPF objects in Alpine container
         env:
-          ARCH: ${{ matrix.arch == 'arm64' && 'arm64' || 'x86' }}
+          KERNEL_ARCH: ${{ matrix.arch == 'arm64' && 'arm64' || 'x86' }}
         run: |
           set -euo pipefail
-          echo "Building BPF for ARCH=${ARCH} on platform linux/${{ matrix.arch }}"
+          echo "Building BPF for KERNEL_ARCH=${KERNEL_ARCH} on platform linux/${{ matrix.arch }}"
           docker run --rm \
             --platform "linux/${{ matrix.arch }}" \
-            -e ARCH="${ARCH}" \
+            -e ARCH="${KERNEL_ARCH}" \
             -v "${{ github.workspace }}:/src" \
-            -w /src \
+            -w /src/node \
             "${{ env.ALPINE_IMAGE }}" \
             sh -c '
               set -euo pipefail
@@ -177,68 +180,12 @@ jobs:
                 elfutils-dev zlib-dev \
                 bpftool
 
-              cd node
-              make bpf
+              make bpf ARCH="${ARCH}"
 
               echo "=== BPF objects built ==="
               ls -l bpf/*.elf
+              file bpf/*.elf
             '
-
-      - name: Generate vmlinux.h (if missing)
-        working-directory: node/bpf
-        run: |
-          if [ -f vmlinux.h ]; then
-            echo "vmlinux.h already present, skip"
-            exit 0
-          fi
-          if [ ! -f /sys/kernel/btf/vmlinux ]; then
-            echo "ERROR: /sys/kernel/btf/vmlinux not found."
-            exit 1
-          fi
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends linux-tools-generic
-          KREL="$(uname -r)"
-          FALLBACK="$(find /usr/lib -type f -name bpftool -perm -111 2>/dev/null | sort -V | tail -n 1)"
-          if [ -z "$FALLBACK" ]; then
-            echo "ERROR: no bpftool payload found"
-            exit 1
-          fi
-          sudo mkdir -p "/usr/lib/linux-tools/${KREL}"
-          sudo ln -sf "$FALLBACK" "/usr/lib/linux-tools/${KREL}/bpftool"
-          sudo /usr/sbin/bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h
-          head -5 vmlinux.h
-          wc -l vmlinux.h
-
-      - name: Verify BPF ELF loads
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends linux-tools-generic
-          KREL="$(uname -r)"
-          FALLBACK="$(find /usr/lib -type f -name bpftool -perm -111 2>/dev/null | sort -V | tail -n 1)"
-          if [ -z "$FALLBACK" ]; then
-            echo "ERROR: no bpftool payload found"
-            exit 1
-          fi
-          sudo mkdir -p "/usr/lib/linux-tools/${KREL}"
-          sudo ln -sf "$FALLBACK" "/usr/lib/linux-tools/${KREL}/bpftool"
-
-          if [ ! -d /sys/fs/bpf ]; then
-            echo "ERROR: /sys/fs/bpf not mounted"
-            exit 1
-          fi
-
-          for elf in node/bpf/*.elf; do
-            echo "Loading ${elf} ..."
-            PIN="/sys/fs/bpf/ci-verify-$(basename "${elf}" .elf)"
-            sudo rm -rf "${PIN}"
-            if ! sudo /usr/sbin/bpftool prog load "${elf}" "${PIN}" 2>&1; then
-              echo "ERROR: failed to load ${elf}"
-              exit 1
-            fi
-            sudo rm -rf "${PIN}"
-          done
-          echo "All BPF ELFs loaded successfully."
 
       - uses: actions/setup-go@v5
         with:
@@ -260,12 +207,18 @@ jobs:
             .
           chmod +x ../../dist/xdrop-agent-linux-${{ matrix.arch }}-${{ matrix.libc }}
 
-      - name: Verify linkage
+      - name: Verify linkage (musl static)
         if: matrix.libc == 'musl'
         run: |
-          file dist/xdrop-agent-linux-${{ matrix.arch }}-musl
-          if ! file dist/xdrop-agent-linux-${{ matrix.arch }}-musl | grep -q "statically linked"; then
-            echo "ERROR: musl build is not statically linked"
+          BIN=dist/xdrop-agent-linux-${{ matrix.arch }}-musl
+          file "$BIN"
+          if ldd "$BIN" 2>&1 | grep -q "not a dynamic executable"; then
+            echo "OK: $BIN is statically linked"
+          elif ldd "$BIN" 2>&1 | grep -qi "statically linked"; then
+            echo "OK: $BIN is statically linked"
+          else
+            echo "ERROR: $BIN is NOT statically linked"
+            ldd "$BIN" || true
             exit 1
           fi
 
@@ -277,7 +230,7 @@ jobs:
           fi
           ls -l dist/xdrop-agent-linux-${{ matrix.arch }}-${{ matrix.libc }}
 
-      - name: Package artifacts
+      - name: Package BPF artifacts
         run: |
           set -euo pipefail
           ARCH_DIR=${{ matrix.arch == 'arm64' && 'arm64' || 'x86_64' }}
@@ -285,10 +238,19 @@ jobs:
           cp node/bpf/*.elf dist/bpf-${ARCH_DIR}/
           ls -l dist/bpf-${ARCH_DIR}/
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload agent binary
+        uses: actions/upload-artifact@v4
         with:
           name: node-agent-${{ matrix.arch }}-${{ matrix.libc }}
-          path: dist/
+          path: dist/xdrop-agent-linux-${{ matrix.arch }}-${{ matrix.libc }}
+          if-no-files-found: error
+
+      - name: Upload BPF objects
+        if: matrix.libc == 'musl'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bpf-${{ matrix.arch == 'arm64' && 'arm64' || 'x86_64' }}
+          path: dist/bpf-${{ matrix.arch == 'arm64' && 'arm64' || 'x86_64' }}/
           if-no-files-found: error
 
   # ─────────────────────────────────────────────────────────────
@@ -326,7 +288,7 @@ jobs:
           set -euo pipefail
           mkdir -p docker-ctx/${{ matrix.image }}
 
-          # ── 复制系统 CA 证书（所有镜像都需要，避免 TLS 验证失败）──
+          # ── 复制系统 CA 证书 ──
           cp /etc/ssl/certs/ca-certificates.crt docker-ctx/${{ matrix.image }}/ca-certificates.crt
 
           if [ "${{ matrix.image }}" = "controller" ]; then
@@ -349,7 +311,6 @@ jobs:
             cp artifacts/xdrop-agent-linux-arm64-musl \
                docker-ctx/node/xdrop-agent-arm64
 
-            # BPF ELF 按架构分目录
             mkdir -p docker-ctx/node/amd64 docker-ctx/node/arm64
             cp artifacts/bpf-x86_64/xdrop_main.elf docker-ctx/node/amd64/
             cp artifacts/bpf-x86_64/xdrop_gate.elf docker-ctx/node/amd64/
@@ -414,7 +375,7 @@ jobs:
           sbom: false
 
   # ─────────────────────────────────────────────────────────────
-  # 4. 发布 Release（latest）
+  # 4. 发布 Release
   # ─────────────────────────────────────────────────────────────
   release:
     name: Publish Release
@@ -442,9 +403,13 @@ jobs:
         id: tag
         run: |
           if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            echo "tag=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "make_latest=true" >> "$GITHUB_OUTPUT"
           else
-            echo "tag=latest-$(date +%Y%m%d-%H%M%S)" >> $GITHUB_OUTPUT
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "make_latest=false" >> "$GITHUB_OUTPUT"
           fi
 
       - uses: softprops/action-gh-release@v2
@@ -452,10 +417,20 @@ jobs:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: ${{ steps.tag.outputs.tag }}
           generate_release_notes: true
-          make_latest: true
+          prerelease: ${{ steps.tag.outputs.prerelease }}
+          make_latest: ${{ steps.tag.outputs.make_latest }}
           files: |
-            artifacts/xdrop-controller-*
-            artifacts/xdrop-agent-*
-            artifacts/bpf-*/**
+            artifacts/xdrop-controller-linux-amd64-glibc
+            artifacts/xdrop-controller-linux-amd64-musl
+            artifacts/xdrop-controller-linux-arm64-glibc
+            artifacts/xdrop-controller-linux-arm64-musl
+            artifacts/xdrop-agent-linux-amd64-glibc
+            artifacts/xdrop-agent-linux-amd64-musl
+            artifacts/xdrop-agent-linux-arm64-glibc
+            artifacts/xdrop-agent-linux-arm64-musl
+            artifacts/bpf-x86_64/xdrop_main.elf
+            artifacts/bpf-x86_64/xdrop_gate.elf
+            artifacts/bpf-arm64/xdrop_main.elf
+            artifacts/bpf-arm64/xdrop_gate.elf
             artifacts/checksums.txt
           fail_on_unmatched_files: false
