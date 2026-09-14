@@ -39,8 +39,8 @@ typedef _Bool bool;
 #endif
 
 // Configuration
-#define MAX_RULES 500000
-#define MAX_WHITELIST 50000
+#define MAX_RULES 50000
+#define MAX_WHITELIST 5000
 
 // Protocol definitions
 #define PROTO_ALL 0
