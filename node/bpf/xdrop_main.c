@@ -101,7 +101,7 @@ BPF_MAP_DEF(sv4_cidr_trie) = {
     .map_type = BPF_MAP_TYPE_LPM_TRIE,
     .key_size = sizeof(struct cidr_v4_lpm_key),
     .value_size = sizeof(__u32),
-    .max_entries = 50000,
+    .max_entries = 10000,
     .map_flags = BPF_F_NO_PREALLOC,
 };
 BPF_MAP_ADD(sv4_cidr_trie);
@@ -111,7 +111,7 @@ BPF_MAP_DEF(dv4_cidr_trie) = {
     .map_type = BPF_MAP_TYPE_LPM_TRIE,
     .key_size = sizeof(struct cidr_v4_lpm_key),
     .value_size = sizeof(__u32),
-    .max_entries = 50000,
+    .max_entries = 10000,
     .map_flags = BPF_F_NO_PREALLOC,
 };
 BPF_MAP_ADD(dv4_cidr_trie);
@@ -121,7 +121,7 @@ BPF_MAP_DEF(sv6_cidr_trie) = {
     .map_type = BPF_MAP_TYPE_LPM_TRIE,
     .key_size = sizeof(struct cidr_v6_lpm_key),
     .value_size = sizeof(__u32),
-    .max_entries = 50000,
+    .max_entries = 10000,
     .map_flags = BPF_F_NO_PREALLOC,
 };
 BPF_MAP_ADD(sv6_cidr_trie);
@@ -131,7 +131,7 @@ BPF_MAP_DEF(dv6_cidr_trie) = {
     .map_type = BPF_MAP_TYPE_LPM_TRIE,
     .key_size = sizeof(struct cidr_v6_lpm_key),
     .value_size = sizeof(__u32),
-    .max_entries = 50000,
+    .max_entries = 10000,
     .map_flags = BPF_F_NO_PREALLOC,
 };
 BPF_MAP_ADD(dv6_cidr_trie);
