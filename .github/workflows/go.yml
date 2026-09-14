@@ -159,10 +159,12 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
       - name: Install CGO build deps
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc libc6-dev musl-tools
+
       # ── BPF 编译：不走 make，直接 clang，避免改 Makefile ──
       - name: Build BPF objects in Alpine container
         env:
@@ -260,6 +262,7 @@ jobs:
           path: dist/xdrop-agent-linux-${{ matrix.arch }}-${{ matrix.libc }}
           if-no-files-found: error
 
+      # ▼ 注意：path 末尾不带 /，让 artifact 内部保留 bpf-x86_64/ 或 bpf-arm64/ 子目录
       - name: Upload BPF objects
         if: matrix.libc == 'musl'
         uses: actions/upload-artifact@v4
@@ -291,11 +294,15 @@ jobs:
           path: artifacts/
           merge-multiple: true
 
+      - name: Show artifact tree
+        run: |
+          echo "=== artifacts tree ==="
+          find artifacts/ -type f -exec ls -lh {} \;
+
       - name: Restore executable bits
         run: |
           chmod +x artifacts/xdrop-controller-* 2>/dev/null || true
           chmod +x artifacts/xdrop-agent-* 2>/dev/null || true
-          ls -l artifacts/ | head -20
 
       - name: Prepare docker context
         run: |
