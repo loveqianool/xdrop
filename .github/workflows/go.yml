@@ -160,6 +160,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # ── BPF 编译：不走 make，直接 clang，避免改 Makefile ──
       - name: Build BPF objects in Alpine container
         env:
           KERNEL_ARCH: ${{ matrix.arch == 'arm64' && 'arm64' || 'x86' }}
@@ -170,7 +171,7 @@ jobs:
             --platform "linux/${{ matrix.arch }}" \
             -e ARCH="${KERNEL_ARCH}" \
             -v "${{ github.workspace }}:/src" \
-            -w /src/node \
+            -w /src/node/bpf \
             "${{ env.ALPINE_IMAGE }}" \
             sh -c '
               set -euo pipefail
@@ -178,13 +179,24 @@ jobs:
                 clang llvm make \
                 linux-headers libbpf-dev \
                 elfutils-dev zlib-dev \
-                bpftool
+                bpftool file
 
-              make bpf ARCH="${ARCH}"
+              echo "ARCH inside container = ${ARCH}"
+
+              CFLAGS="-O2 -g -Wall -target bpf -D__BPF__ -I./headers -D__TARGET_ARCH_${ARCH}"
+
+              echo "clang $CFLAGS -c xdrop_main.c -o xdrop_main.elf"
+              clang $CFLAGS -c xdrop_main.c -o xdrop_main.elf
+
+              echo "clang $CFLAGS -c xdrop_gate.c -o xdrop_gate.elf"
+              clang $CFLAGS -c xdrop_gate.c -o xdrop_gate.elf
 
               echo "=== BPF objects built ==="
-              ls -l bpf/*.elf
-              file bpf/*.elf
+              ls -l *.elf
+              for f in *.elf; do
+                echo "--- $f ---"
+                llvm-readelf -h "$f" | grep -E "Class|Machine|Type"
+              done
             '
 
       - uses: actions/setup-go@v5
@@ -255,7 +267,6 @@ jobs:
 
   # ─────────────────────────────────────────────────────────────
   # 3. Docker 镜像 — 多平台，推 ghcr.io
-  #    scratch + musl 静态二进制 + CA 证书 + BPF ELF
   # ─────────────────────────────────────────────────────────────
   docker:
     name: Docker (${{ matrix.image }})
@@ -288,7 +299,6 @@ jobs:
           set -euo pipefail
           mkdir -p docker-ctx/${{ matrix.image }}
 
-          # ── 复制系统 CA 证书 ──
           cp /etc/ssl/certs/ca-certificates.crt docker-ctx/${{ matrix.image }}/ca-certificates.crt
 
           if [ "${{ matrix.image }}" = "controller" ]; then
