@@ -11,10 +11,11 @@ permissions:
   packages: write
 
 env:
-  GO_VERSION: '1.24'
-  NODE_VERSION: '20'
+  GO_VERSION: 'stable'
+  NODE_VERSION: 'lts/*'
   REGISTRY: ghcr.io
   IMAGE_PREFIX: ${{ github.repository_owner }}/xdrop
+  ALPINE_IMAGE: alpine:latest
 
 jobs:
   # ─────────────────────────────────────────────────────────────
@@ -30,25 +31,25 @@ jobs:
           - arch: amd64
             goarch: amd64
             libc: glibc
-            runner: ubuntu-22.04
+            runner: ubuntu-latest
             cc: gcc
             static_flags: ''
           - arch: amd64
             goarch: amd64
             libc: musl
-            runner: ubuntu-22.04
+            runner: ubuntu-latest
             cc: musl-gcc
             static_flags: "-linkmode external -extldflags '-static'"
           - arch: arm64
             goarch: arm64
             libc: glibc
-            runner: ubuntu-22.04-arm
+            runner: ubuntu-24.04-arm
             cc: gcc
             static_flags: ''
           - arch: arm64
             goarch: arm64
             libc: musl
-            runner: ubuntu-22.04-arm
+            runner: ubuntu-24.04-arm
             cc: musl-gcc
             static_flags: "-linkmode external -extldflags '-static'"
 
@@ -116,7 +117,7 @@ jobs:
           if-no-files-found: error
 
   # ─────────────────────────────────────────────────────────────
-  # 2. Node Agent — 四象限二进制 + BPF ELF
+  # 2. Node Agent — BPF 在 Alpine 容器内编译 + 四象限二进制
   # ─────────────────────────────────────────────────────────────
   node-agent:
     name: Node Agent (${{ matrix.arch }}-${{ matrix.libc }})
@@ -128,48 +129,71 @@ jobs:
           - arch: amd64
             goarch: amd64
             libc: glibc
-            runner: ubuntu-22.04
+            runner: ubuntu-latest
             cc: gcc
             static_flags: ''
           - arch: amd64
             goarch: amd64
             libc: musl
-            runner: ubuntu-22.04
+            runner: ubuntu-latest
             cc: musl-gcc
             static_flags: "-linkmode external -extldflags '-static'"
           - arch: arm64
             goarch: arm64
             libc: glibc
-            runner: ubuntu-22.04-arm
+            runner: ubuntu-24.04-arm
             cc: gcc
             static_flags: ''
           - arch: arm64
             goarch: arm64
             libc: musl
-            runner: ubuntu-22.04-arm
+            runner: ubuntu-24.04-arm
             cc: musl-gcc
             static_flags: "-linkmode external -extldflags '-static'"
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            clang llvm make \
-            linux-libc-dev libbpf-dev \
-            libelf-dev zlib1g-dev \
-            gcc musl-tools \
-            linux-tools-common linux-tools-generic
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
 
-      - name: Ensure bpftool works
-        shell: bash
+      - name: Build BPF objects in Alpine container
+        env:
+          ARCH: ${{ matrix.arch == 'arm64' && 'arm64' || 'x86' }}
         run: |
           set -euo pipefail
-          if /usr/sbin/bpftool -V >/dev/null 2>&1; then
-            echo "bpftool works"
+          echo "Building BPF for ARCH=${ARCH} on platform linux/${{ matrix.arch }}"
+          docker run --rm \
+            --platform "linux/${{ matrix.arch }}" \
+            -e ARCH="${ARCH}" \
+            -v "${{ github.workspace }}:/src" \
+            -w /src \
+            "${{ env.ALPINE_IMAGE }}" \
+            sh -c '
+              set -euo pipefail
+              apk add --no-cache \
+                clang llvm make \
+                linux-headers libbpf-dev \
+                elfutils-dev zlib-dev \
+                bpftool
+
+              cd node
+              make bpf
+
+              echo "=== BPF objects built ==="
+              ls -l bpf/*.elf
+            '
+
+      - name: Generate vmlinux.h (if missing)
+        working-directory: node/bpf
+        run: |
+          if [ -f vmlinux.h ]; then
+            echo "vmlinux.h already present, skip"
             exit 0
+          fi
+          if [ ! -f /sys/kernel/btf/vmlinux ]; then
+            echo "ERROR: /sys/kernel/btf/vmlinux not found."
+            exit 1
           fi
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends linux-tools-generic
@@ -181,34 +205,45 @@ jobs:
           fi
           sudo mkdir -p "/usr/lib/linux-tools/${KREL}"
           sudo ln -sf "$FALLBACK" "/usr/lib/linux-tools/${KREL}/bpftool"
-          /usr/sbin/bpftool -V
+          sudo /usr/sbin/bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h
+          head -5 vmlinux.h
+          wc -l vmlinux.h
+
+      - name: Verify BPF ELF loads
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends linux-tools-generic
+          KREL="$(uname -r)"
+          FALLBACK="$(find /usr/lib -type f -name bpftool -perm -111 2>/dev/null | sort -V | tail -n 1)"
+          if [ -z "$FALLBACK" ]; then
+            echo "ERROR: no bpftool payload found"
+            exit 1
+          fi
+          sudo mkdir -p "/usr/lib/linux-tools/${KREL}"
+          sudo ln -sf "$FALLBACK" "/usr/lib/linux-tools/${KREL}/bpftool"
+
+          if [ ! -d /sys/fs/bpf ]; then
+            echo "ERROR: /sys/fs/bpf not mounted"
+            exit 1
+          fi
+
+          for elf in node/bpf/*.elf; do
+            echo "Loading ${elf} ..."
+            PIN="/sys/fs/bpf/ci-verify-$(basename "${elf}" .elf)"
+            sudo rm -rf "${PIN}"
+            if ! sudo /usr/sbin/bpftool prog load "${elf}" "${PIN}" 2>&1; then
+              echo "ERROR: failed to load ${elf}"
+              exit 1
+            fi
+            sudo rm -rf "${PIN}"
+          done
+          echo "All BPF ELFs loaded successfully."
 
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
           cache-dependency-path: node/agent/go.sum
-
-      - name: Generate vmlinux.h
-        working-directory: node/bpf
-        run: |
-          if [ -f vmlinux.h ]; then
-            echo "vmlinux.h already present, skip"
-            exit 0
-          fi
-          if [ ! -f /sys/kernel/btf/vmlinux ]; then
-            echo "ERROR: /sys/kernel/btf/vmlinux not found."
-            exit 1
-          fi
-          sudo bpftool btf dump file /sys/kernel/btf/vmlinux format c > vmlinux.h
-          head -5 vmlinux.h
-          wc -l vmlinux.h
-
-      - name: Build BPF objects
-        working-directory: node
-        env:
-          CC: clang
-          ARCH: ${{ matrix.arch == 'arm64' && 'arm64' || 'x86' }}
-        run: make bpf
 
       - name: Build node agent
         working-directory: node/agent
@@ -244,9 +279,11 @@ jobs:
 
       - name: Package artifacts
         run: |
+          set -euo pipefail
           ARCH_DIR=${{ matrix.arch == 'arm64' && 'arm64' || 'x86_64' }}
           mkdir -p dist/bpf-${ARCH_DIR}
-          cp node/bpf/*.elf dist/bpf-${ARCH_DIR}/ 2>/dev/null || true
+          cp node/bpf/*.elf dist/bpf-${ARCH_DIR}/
+          ls -l dist/bpf-${ARCH_DIR}/
 
       - uses: actions/upload-artifact@v4
         with:
@@ -261,7 +298,7 @@ jobs:
   docker:
     name: Docker (${{ matrix.image }})
     needs: [controller, node-agent]
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
@@ -290,7 +327,6 @@ jobs:
           mkdir -p docker-ctx/${{ matrix.image }}
 
           # ── 复制系统 CA 证书（所有镜像都需要，避免 TLS 验证失败）──
-          # Ubuntu runner 上的 ca-certificates 包提供这个文件
           cp /etc/ssl/certs/ca-certificates.crt docker-ctx/${{ matrix.image }}/ca-certificates.crt
 
           if [ "${{ matrix.image }}" = "controller" ]; then
@@ -383,7 +419,7 @@ jobs:
   release:
     name: Publish Release
     needs: [controller, node-agent]
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     if: github.event_name != 'pull_request'
 
     steps:
