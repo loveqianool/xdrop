@@ -1,0 +1,381 @@
+name: Release
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  GO_VERSION: 'stable'
+  NODE_VERSION: 'lts/*'
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ${{ github.repository_owner }}/xdrop
+  ALPINE_IMAGE: alpine:3.24
+
+jobs:
+  controller:
+    name: Controller (${{ matrix.arch }}-${{ matrix.libc }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            goarch: amd64
+            libc: glibc
+            runner: ubuntu-latest
+            cc: gcc
+          - arch: amd64
+            goarch: amd64
+            libc: musl
+            runner: ubuntu-latest
+            cc: musl-gcc
+          - arch: arm64
+            goarch: arm64
+            libc: glibc
+            runner: ubuntu-24.04-arm
+            cc: gcc
+          - arch: arm64
+            goarch: arm64
+            libc: musl
+            runner: ubuntu-24.04-arm
+            cc: musl-gcc
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: controller/go.sum
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: controller/web/package-lock.json
+
+      - name: Install CGO build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc libc6-dev musl-tools
+
+      - name: Build frontend
+        working-directory: controller/web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build controller binary
+        working-directory: controller
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '1'
+          CC: ${{ matrix.cc }}
+          CGO_LDFLAGS: ${{ matrix.libc == 'musl' && '-static' || '' }}
+        run: |
+          go build -trimpath \
+            -ldflags "-s -w -X main.version=${GITHUB_REF_NAME:-dev}" \
+            -o ../dist/xdrop-controller-linux-${{ matrix.arch }}-${{ matrix.libc }} \
+            ./cmd/controller
+          chmod +x ../dist/xdrop-controller-linux-${{ matrix.arch }}-${{ matrix.libc }}
+
+      - name: Verify linkage (musl static)
+        if: matrix.libc == 'musl'
+        run: |
+          BIN=dist/xdrop-controller-linux-${{ matrix.arch }}-musl
+          file "$BIN"
+          if ldd "$BIN" 2>&1 | grep -q "not a dynamic executable"; then
+            echo "OK: $BIN is statically linked"
+          elif ldd "$BIN" 2>&1 | grep -qi "statically linked"; then
+            echo "OK: $BIN is statically linked"
+          else
+            echo "ERROR: $BIN is NOT statically linked"
+            ldd "$BIN" || true
+            exit 1
+          fi
+
+      - name: Verify executable bit
+        run: |
+          if [ ! -x dist/xdrop-controller-linux-${{ matrix.arch }}-${{ matrix.libc }} ]; then
+            echo "ERROR: binary is not executable"
+            exit 1
+          fi
+          ls -l dist/xdrop-controller-linux-${{ matrix.arch }}-${{ matrix.libc }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: controller-${{ matrix.arch }}-${{ matrix.libc }}
+          path: dist/xdrop-controller-linux-${{ matrix.arch }}-${{ matrix.libc }}
+          if-no-files-found: error
+
+  node-agent:
+    name: Node Agent (${{ matrix.arch }}-${{ matrix.libc }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            goarch: amd64
+            libc: glibc
+            runner: ubuntu-latest
+            cc: gcc
+          - arch: amd64
+            goarch: amd64
+            libc: musl
+            runner: ubuntu-latest
+            cc: musl-gcc
+          - arch: arm64
+            goarch: arm64
+            libc: glibc
+            runner: ubuntu-24.04-arm
+            cc: gcc
+          - arch: arm64
+            goarch: arm64
+            libc: musl
+            runner: ubuntu-24.04-arm
+            cc: musl-gcc
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CGO build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc libc6-dev musl-tools
+
+      - name: Build BPF objects in Alpine container (clang21)
+        env:
+          KERNEL_ARCH: ${{ matrix.arch == 'arm64' && 'arm64' || 'x86' }}
+        run: |
+          set -euo pipefail
+          echo "Building BPF for KERNEL_ARCH=${KERNEL_ARCH} on platform linux/${{ matrix.arch }}"
+          docker run --rm \
+            --platform "linux/${{ matrix.arch }}" \
+            -e ARCH="${KERNEL_ARCH}" \
+            -v "${{ github.workspace }}:/src" \
+            -w /src/node/bpf \
+            "${{ env.ALPINE_IMAGE }}" \
+            sh -c '
+              set -euo pipefail
+              apk add --no-cache \
+                clang21 llvm21 make \
+                linux-headers libbpf-dev \
+                elfutils-dev zlib-dev \
+                bpftool file
+
+              CLANG=/usr/lib/llvm21/bin/clang
+              READELF=/usr/lib/llvm21/bin/llvm-readelf
+
+              echo "=== clang version ==="
+              $CLANG --version
+
+              echo "ARCH inside container = ${ARCH}"
+
+              CFLAGS="-O2 -g -Wall -target bpf -D__BPF__ -I./headers -D__TARGET_ARCH_${ARCH}"
+
+              $CLANG $CFLAGS -c xdrop_main.c -o xdrop_main.elf
+              $CLANG $CFLAGS -c xdrop_gate.c -o xdrop_gate.elf
+
+              echo "=== BPF objects built ==="
+              ls -l *.elf
+              for f in *.elf; do
+                echo "--- $f ---"
+                $READELF -h "$f" | grep -E "Class|Machine|Type"
+              done
+
+              echo "=== approximate BPF instruction counts ==="
+              for f in *.elf; do
+                echo -n "$f: "
+                /usr/lib/llvm21/bin/llvm-objdump -d "$f" | grep -cE "^\s+[0-9a-f]+:" || true
+              done
+            '
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: node/agent/go.sum
+
+      - name: Build node agent
+        working-directory: node/agent
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '1'
+          CC: ${{ matrix.cc }}
+          CGO_LDFLAGS: ${{ matrix.libc == 'musl' && '-static' || '' }}
+        run: |
+          go build -trimpath \
+            -ldflags "-s -w -X main.version=${GITHUB_REF_NAME:-dev}" \
+            -o ../../dist/xdrop-agent-linux-${{ matrix.arch }}-${{ matrix.libc }} \
+            .
+          chmod +x ../../dist/xdrop-agent-linux-${{ matrix.arch }}-${{ matrix.libc }}
+
+      - name: Verify linkage (musl static)
+        if: matrix.libc == 'musl'
+        run: |
+          BIN=dist/xdrop-agent-linux-${{ matrix.arch }}-musl
+          file "$BIN"
+          if ldd "$BIN" 2>&1 | grep -q "not a dynamic executable"; then
+            echo "OK: $BIN is statically linked"
+          elif ldd "$BIN" 2>&1 | grep -qi "statically linked"; then
+            echo "OK: $BIN is statically linked"
+          else
+            echo "ERROR: $BIN is NOT statically linked"
+            ldd "$BIN" || true
+            exit 1
+          fi
+
+      - name: Verify executable bit
+        run: |
+          if [ ! -x dist/xdrop-agent-linux-${{ matrix.arch }}-${{ matrix.libc }} ]; then
+            echo "ERROR: binary is not executable"
+            exit 1
+          fi
+          ls -l dist/xdrop-agent-linux-${{ matrix.arch }}-${{ matrix.libc }}
+
+      - name: Package BPF artifacts
+        run: |
+          set -euo pipefail
+          ARCH_DIR=${{ matrix.arch == 'arm64' && 'arm64' || 'x86_64' }}
+          mkdir -p dist/bpf-${ARCH_DIR}
+          cp node/bpf/*.elf dist/bpf-${ARCH_DIR}/
+          ls -l dist/bpf-${ARCH_DIR}/
+
+      - name: Upload agent binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-agent-${{ matrix.arch }}-${{ matrix.libc }}
+          path: dist/xdrop-agent-linux-${{ matrix.arch }}-${{ matrix.libc }}
+          if-no-files-found: error
+
+      - name: Upload BPF objects
+        if: matrix.libc == 'musl'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bpf-${{ matrix.arch == 'arm64' && 'arm64' || 'x86_64' }}
+          path: dist/bpf-${{ matrix.arch == 'arm64' && 'arm64' || 'x86_64' }}/
+          if-no-files-found: error
+
+  docker:
+    name: Docker (${{ matrix.image }})
+    needs: [controller, node-agent]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: controller
+          - image: node
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Show artifact tree
+        run: |
+          echo "=== artifacts tree ==="
+          find artifacts/ -type f -exec ls -lh {} \;
+
+      - name: Restore executable bits
+        run: |
+          find artifacts/ -name 'xdrop-controller-*' -exec chmod +x {} \;
+          find artifacts/ -name 'xdrop-agent-*' -exec chmod +x {} \;
+
+      - name: Prepare docker context
+        run: |
+          set -euo pipefail
+          mkdir -p docker-ctx/${{ matrix.image }}
+
+          cp /etc/ssl/certs/ca-certificates.crt docker-ctx/${{ matrix.image }}/ca-certificates.crt
+
+          if [ "${{ matrix.image }}" = "controller" ]; then
+            cp artifacts/controller-amd64-musl/xdrop-controller-linux-amd64-musl \
+               docker-ctx/controller/xdrop-controller-amd64
+            cp artifacts/controller-arm64-musl/xdrop-controller-linux-arm64-musl \
+               docker-ctx/controller/xdrop-controller-arm64
+
+            {
+              printf '%s\n' 'FROM scratch'
+              printf '%s\n' 'ARG TARGETARCH'
+              printf '%s\n' 'COPY --chmod=0755 xdrop-controller-${TARGETARCH} /xdrop-controller'
+              printf '%s\n' 'COPY --chmod=0644 ca-certificates.crt /etc/ssl/certs/ca-certificates.crt'
+              printf '%s\n' 'EXPOSE 8000'
+              printf '%s\n' 'VOLUME ["/data"]'
+              printf '%s\n' 'ENTRYPOINT ["/xdrop-controller"]'
+            } > docker-ctx/controller/Dockerfile
+          else
+            cp artifacts/node-agent-amd64-musl/xdrop-agent-linux-amd64-musl \
+               docker-ctx/node/xdrop-agent-amd64
+            cp artifacts/node-agent-arm64-musl/xdrop-agent-linux-arm64-musl \
+               docker-ctx/node/xdrop-agent-arm64
+
+            mkdir -p docker-ctx/node/amd64 docker-ctx/node/arm64
+            cp artifacts/bpf-x86_64/xdrop_main.elf docker-ctx/node/amd64/
+            cp artifacts/bpf-x86_64/xdrop_gate.elf docker-ctx/node/amd64/
+            cp artifacts/bpf-arm64/xdrop_main.elf  docker-ctx/node/arm64/
+            cp artifacts/bpf-arm64/xdrop_gate.elf  docker-ctx/node/arm64/
+
+            {
+              printf '%s\n' 'FROM scratch'
+              printf '%s\n' 'ARG TARGETARCH'
+              printf '%s\n' 'COPY --chmod=0755 xdrop-agent-${TARGETARCH} /xdrop-agent'
+              printf '%s\n' 'COPY --chmod=0644 ${TARGETARCH}/xdrop_main.elf /bpf/xdrop_main.elf'
+              printf '%s\n' 'COPY --chmod=0644 ${TARGETARCH}/xdrop_gate.elf /bpf/xdrop_gate.elf'
+              printf '%s\n' 'COPY --chmod=0644 ca-certificates.crt /etc/ssl/certs/ca-certificates.crt'
+              printf '%s\n' 'ENTRYPOINT ["/xdrop-agent"]'
+            } > docker-ctx/node/Dockerfile
+          fi
+
+          echo "=== docker-ctx tree ==="
+          find docker-ctx -type f -exec ls -l {} \;
+          echo "=== Dockerfile ==="
+          cat docker-ctx/${{ matrix.image }}/Dockerfile
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-${{ matrix.image }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: docker-ctx/${{ matrix.image }}
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+          sbom: false
